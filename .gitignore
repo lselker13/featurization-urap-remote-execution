@@ -1,0 +1,17 @@
+# Local data directories
+data_for_bucket/
+submission_logs_from_bucket/
+local_logs/
+
+# Python compiled files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+
+# Distribution / packaging
+*.egg
+*.egg-info/
+dist/
+build/

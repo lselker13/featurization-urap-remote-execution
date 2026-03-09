@@ -1,0 +1,5 @@
+bindings:
+- members:
+  - group:featurization_urap_server_callers@googlegroups.com
+  role: roles/run.invoker
+version: 1
