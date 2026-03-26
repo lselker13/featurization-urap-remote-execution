@@ -4,5 +4,6 @@
 
 SCRIPT_DIR="$(dirname "$0")"
 
-bash "$SCRIPT_DIR/deploy_job.sh"
 bash "$SCRIPT_DIR/deploy_service.sh"
+bash "$SCRIPT_DIR/deploy_vertex.sh"
+# bash "$SCRIPT_DIR/deploy_job.sh"

@@ -22,7 +22,7 @@ def main():
 
     with open(json_path) as f:
         payload = json.load(f)
-
+    print(f"Running job: user={payload['user']} full_run={payload['full_run']}")
     result = run_job(payload['code'], payload['user'], DATA_DIR, payload['full_run'])
 
     if not result.get('success'):

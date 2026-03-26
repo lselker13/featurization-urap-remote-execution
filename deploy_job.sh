@@ -12,13 +12,13 @@ gcloud run jobs deploy "$JOB_NAME" \
   --source job \
   --region "$REGION" \
   --execution-environment gen2 \
-  --memory 16Gi \
+  --memory 32Gi \
   --cpu 8 \
   --task-timeout 4h \
   --max-retries 0 \
   --add-volume name=data,type=cloud-storage,bucket=featurization-test-bucket \
   --add-volume-mount volume=data,mount-path=/data \
-  --set-env-vars GMAIL_APP_PASSWORD="iaoq hrkt zamw glhy"
+  --set-env-vars "GMAIL_APP_PASSWORD=iaoq hrkt zamw glhy,DATA_DIR=/data/input_data/togo"
 
 # Grant the default Compute service account permission to trigger the job.
 # Cloud Run services run as PROJECT_NUMBER-compute@developer.gserviceaccount.com by default.

@@ -56,11 +56,14 @@ RF_PARAM_GRID = {
     "model__max_features": ["sqrt", "log2", 0.5],
 }
 TORCH_GRID = list(ParameterGrid({
-    "lr": [1e-2, 1e-3, 3e-4],
-    "patience": [10, 20, 30],
+    "lr": [1e-3, 3e-4],
+    "weight_decay": [1e-3, 1e-4, 1e-5],
+    "patience": [10],
 }))
+TORCH_LIGHT_PARAMS = {"lr": 1e-3, "weight_decay": 1e-4, "patience": 10}
 
 LOAD_EXISTING_FEATURES = True
+NN_LIGHT_MODE = False  # True: skip inner CV for NN (~6x faster); False: full nested CV
 
 SHEET_ID = '13vZkBNoI1TNKEuWJhtFospr_XNR23DpZTobjaKAJneA'
 SHEET_TAB = 'Results log'
@@ -80,7 +83,7 @@ class _TorchMLP(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.3),
             nn.Linear(hidden_dim, 1),
         )
 
@@ -89,19 +92,27 @@ class _TorchMLP(nn.Module):
 
 
 class _TorchRegressorWrapper:
-    def __init__(self, input_dim, hidden_dim=64, lr=1e-3, epochs=500, patience=20, device='cpu'):
+    def __init__(self, input_dim, hidden_dim=64, lr=1e-3, weight_decay=1e-4, epochs=500, patience=20, device='cpu'):
         self.device = device
         self.model = _TorchMLP(input_dim, hidden_dim).to(device)
-        self.opt = optim.Adam(self.model.parameters(), lr=lr)
+        self.opt = optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
         self.epochs = epochs
         self.patience = patience
         self.loss_fn = nn.MSELoss()
 
-    def fit(self, X, y, batch_size=64):
-        X_t = torch.tensor(X, dtype=torch.float32)
-        y_t = torch.tensor(y, dtype=torch.float32).unsqueeze(1)
+    def fit(self, X, y, val_frac=0.15, batch_size=64):
+        n = len(X)
+        n_val = max(1, int(n * val_frac))
+        perm = np.random.default_rng(RANDOM_SEED).permutation(n)
+        val_idx, train_idx = perm[:n_val], perm[n_val:]
+
+        X_train_t = torch.tensor(X[train_idx], dtype=torch.float32)
+        y_train_t = torch.tensor(y[train_idx], dtype=torch.float32).unsqueeze(1)
+        X_val_t = torch.tensor(X[val_idx], dtype=torch.float32).to(self.device)
+        y_val_t = torch.tensor(y[val_idx], dtype=torch.float32).unsqueeze(1).to(self.device)
+
         loader = torch.utils.data.DataLoader(
-            torch.utils.data.TensorDataset(X_t, y_t), batch_size=batch_size, shuffle=True
+            torch.utils.data.TensorDataset(X_train_t, y_train_t), batch_size=batch_size, shuffle=True
         )
         best_loss, patience_left, best_state = float('inf'), self.patience, None
 
@@ -115,10 +126,7 @@ class _TorchRegressorWrapper:
 
             self.model.eval()
             with torch.no_grad():
-                val_loss = self.loss_fn(
-                    self.model(X_t.to(self.device)),
-                    y_t.to(self.device)
-                ).item()
+                val_loss = self.loss_fn(self.model(X_val_t), y_val_t).item()
             if val_loss < best_loss:
                 best_loss = val_loss
                 patience_left = self.patience
@@ -191,8 +199,11 @@ def _torch_inner_cv(X, y, param_grid, inner_kf):
     return best_params
 
 
-def _cv_torch(X, y, param_grid, outer_kf, inner_kf):
-    """Nested CV for the torch MLP; scales inside each outer fold."""
+def _cv_torch(X, y, param_grid, outer_kf, inner_kf, light=False):
+    """Nested CV for the torch MLP; scales inside each outer fold.
+
+    If light=True, skips inner CV and uses TORCH_LIGHT_PARAMS directly (~18x faster).
+    """
     X_arr = X.values if hasattr(X, 'values') else X
     y_arr = y if isinstance(y, np.ndarray) else np.asarray(y)
     fold_preds = []
@@ -205,7 +216,7 @@ def _cv_torch(X, y, param_grid, outer_kf, inner_kf):
         # Replace NaN/inf that may remain after scaling
         X_train_s = np.nan_to_num(X_train_s)
         X_test_s = np.nan_to_num(X_test_s)
-        best_params = _torch_inner_cv(X_train_s, y_train, param_grid, inner_kf)
+        best_params = TORCH_LIGHT_PARAMS if light else _torch_inner_cv(X_train_s, y_train, param_grid, inner_kf)
         model = _TorchRegressorWrapper(X_train_s.shape[1], **best_params)
         model.fit(X_train_s, y_train)
         fold_preds.append((y_test, model.predict(X_test_s)))
@@ -380,13 +391,16 @@ def load_data(data_dir):
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def _run_cv_evaluation(features, consumption, full_run):
+def _run_cv_evaluation(features, consumption, full_run, name=None):
     """
     Run nested CV with Lasso, RF, and NN. Returns bootstrapped metrics per model.
 
     features:    pd.DataFrame indexed by phone_number
     consumption: pd.Series of log_consumption indexed by phone_number
     """
+
+    if name is None:
+        name = ''
     merged = features.join(consumption, how='inner')
     merged = merged.dropna(subset='log_consumption').reset_index(drop=True)
 
@@ -417,23 +431,23 @@ def _run_cv_evaluation(features, consumption, full_run):
 
     all_results = {}
 
-    print(f'starting lasso: {datetime.datetime.now(PACIFIC)}')
+    print(f'starting lasso: {datetime.datetime.now(PACIFIC)}, {name}')
     y_true, y_pred = _cv_sklearn(X, y, lasso_pipeline, LASSO_PARAM_GRID, outer_kf, inner_kf, 'lasso')
     all_results['Lasso'] = _bootstrap_metrics(y_true, y_pred)
 
-    print(f'starting ridge: {datetime.datetime.now(PACIFIC)}')
+    print(f'starting ridge: {datetime.datetime.now(PACIFIC)}, {name}')
     y_true, y_pred = _cv_sklearn(X, y, ridge_pipeline, RIDGE_PARAM_GRID, outer_kf, inner_kf, 'ridge')
     all_results['Ridge'] = _bootstrap_metrics(y_true, y_pred)
 
     if full_run:
-        print(f'starting rf: {datetime.datetime.now(PACIFIC)}')
+        print(f'starting rf: {datetime.datetime.now(PACIFIC)}, {name}')
         y_true, y_pred = _cv_sklearn(X, y, rf_pipeline, RF_PARAM_GRID, outer_kf, inner_kf, 'random forest')
         all_results['Random Forest'] = _bootstrap_metrics(y_true, y_pred)
 
-        print(f'starting NN: {datetime.datetime.now(PACIFIC)}')
-        y_true, y_pred = _cv_torch(X, y.values, TORCH_GRID, outer_kf, inner_kf)
+        print(f'starting NN: {datetime.datetime.now(PACIFIC)}, {name}')
+        y_true, y_pred = _cv_torch(X, y.values, TORCH_GRID, outer_kf, inner_kf, light=NN_LIGHT_MODE)
         all_results['Neural Net'] = _bootstrap_metrics(y_true, y_pred)
-    print(f'done {datetime.datetime.now(PACIFIC)}')
+    print(f'done {datetime.datetime.now(PACIFIC)}, {name}')
     return all_results
 
 
@@ -535,12 +549,12 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run):
         cider_features = togo_dfs['cider_features']
 
         cv_start = time.time()
-        results_alone = _run_cv_evaluation(user_features, consumption, full_run)
+        results_alone = _run_cv_evaluation(user_features, consumption, full_run, 'user only')
         model_rt_alone = round(time.time() - cv_start, 2)
 
         merged_features = user_features.join(cider_features, how='outer')
         cv_start = time.time()
-        results_merged = _run_cv_evaluation(merged_features, consumption, full_run)
+        results_merged = _run_cv_evaluation(merged_features, consumption, full_run, 'merged with existing')
         model_rt_merged = round(time.time() - cv_start, 2)
 
         timestamp = datetime.datetime.now(PACIFIC).isoformat(timespec='seconds')

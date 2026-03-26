@@ -17,7 +17,7 @@ gcloud run deploy "$SERVICE_NAME" \
   --execution-environment gen2 \
   --memory 512Mi \
   --cpu 1 \
-  --timeout 60s \
+  --timeout 50s \
   --max-instances 10 \
   --add-volume name=data,type=cloud-storage,bucket=featurization-test-bucket \
   --add-volume-mount volume=data,mount-path=/data \
