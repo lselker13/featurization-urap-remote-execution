@@ -21,15 +21,12 @@ gcloud artifacts repositories describe "$REPO" \
        --location="$REGION" \
        --project="$PROJECT"
 
-# Build from parent directory so Dockerfile can access both job/ and job_vertex/
 CLOUDBUILD_CONFIG=$(mktemp /tmp/cloudbuild-XXXXXX.yaml)
 cat > "$CLOUDBUILD_CONFIG" <<YAML
 steps:
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - build
-      - -f
-      - job_vertex/Dockerfile
       - -t
       - ${IMAGE_URI}
       - .
@@ -45,7 +42,7 @@ gsutil cp /tmp/sa-key.json gs://featurization-test-bucket/sa-key.json
 rm /tmp/sa-key.json
 
 echo "Building and pushing image..."
-gcloud builds submit . \
+gcloud builds submit job_vertex/ \
   --config="$CLOUDBUILD_CONFIG" \
   --project="$PROJECT"
 rm "$CLOUDBUILD_CONFIG"
