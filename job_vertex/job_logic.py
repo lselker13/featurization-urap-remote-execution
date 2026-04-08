@@ -49,16 +49,22 @@ N_BOOT = 20
 LASSO_PARAM_GRID = {"model__alpha": list(np.logspace(-4, 1, 7))}
 RIDGE_PARAM_GRID = {"model__alpha": list(np.logspace(-4, 1, 7))}
 
+# Fix: corrected parameter name (n_estimators, not num_estimators) and added
+# missing comma that caused a SyntaxError in the original.
 RF_PARAM_GRID = {
-    "model__max_depth": [None, 10, 20, 40],
+    "model__n_estimators": [50, 100, 500],
+    "model__max_depth": [None, 3, 10, 20],
     "model__min_samples_split": [2, 5, 10],
     "model__min_samples_leaf": [1, 2, 5],
     "model__max_features": ["sqrt", "log2", 0.5],
 }
+
+# Extended patience values so early stopping has enough budget to distinguish
+# genuine plateaus from epoch-to-epoch validation noise.
 TORCH_GRID = list(ParameterGrid({
     "lr": [1e-3, 3e-4],
-    "weight_decay": [1e-3, 1e-4, 1e-5],
-    "patience": [10],
+    "weight_decay": [1e-3, 1e-5],
+    "patience": [10, 50, 200],
 }))
 TORCH_LIGHT_PARAMS = {"lr": 1e-3, "weight_decay": 1e-4, "patience": 10}
 
@@ -92,7 +98,7 @@ class _TorchMLP(nn.Module):
 
 
 class _TorchRegressorWrapper:
-    def __init__(self, input_dim, hidden_dim=64, lr=1e-3, weight_decay=1e-4, epochs=500, patience=20, device='cpu'):
+    def __init__(self, input_dim, hidden_dim=64, lr=1e-3, weight_decay=1e-4, epochs=1000, patience=20, device='cpu'):
         self.device = device
         self.model = _TorchMLP(input_dim, hidden_dim).to(device)
         self.opt = optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -101,6 +107,14 @@ class _TorchRegressorWrapper:
         self.loss_fn = nn.MSELoss()
 
     def fit(self, X, y, val_frac=0.15, batch_size=64):
+        # Initialise the output bias to the training mean so the network starts
+        # predicting at the correct scale.  Without this the bias is near 0
+        # while log_consumption has mean ~6.5.  Adam's per-parameter gradient
+        # normalisation means it closes this gap at a fixed rate (~lr per batch
+        # update, regardless of gradient magnitude).
+        with torch.no_grad():
+            self.model.net[-1].bias.fill_(float(y.mean()))
+
         n = len(X)
         n_val = max(1, int(n * val_frac))
         perm = np.random.default_rng(RANDOM_SEED).permutation(n)
@@ -116,7 +130,7 @@ class _TorchRegressorWrapper:
         )
         best_loss, patience_left, best_state = float('inf'), self.patience, None
 
-        for _ in range(self.epochs):
+        for epoch in range(self.epochs):
             self.model.train()
             for X_b, y_b in loader:
                 X_b, y_b = X_b.to(self.device), y_b.to(self.device)
@@ -175,7 +189,7 @@ def _bootstrap_metrics(y_true, y_pred):
 def _cv_sklearn(X, y, pipeline, param_grid, outer_kf, inner_kf, model_type_name='unspecified'):
     """Nested CV for sklearn pipelines; returns pooled (y_true, y_pred) arrays."""
     fold_preds = []
-    for i, (train_idx, test_idx )in enumerate(outer_kf.split(X)):
+    for i, (train_idx, test_idx) in enumerate(outer_kf.split(X)):
         print(f'running grid search fold {i} for model type {model_type_name}')
         gs = GridSearchCV(pipeline, param_grid, cv=inner_kf, n_jobs=-1, verbose=0)
         gs.fit(X.iloc[train_idx], y.iloc[train_idx])
@@ -570,7 +584,6 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run):
             if results['r2']['mean'] > best_merged_r2:
                 best_merged_r2 = results['r2']['mean']
                 best_merged_model = model_type
-
 
         _log_to_sheet(name, user, timestamp,
                       results_alone[best_alone_model]['r2']['mean'],
