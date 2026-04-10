@@ -84,7 +84,7 @@ def _reset_full_run_count(safe_user, year, week):
 # Submission logging
 # ---------------------------------------------------------------------------
 
-def log_submission(user_code, user, log_dir, full_run):
+def log_submission(user_code, user, log_dir, full_run, use_holdout=False):
     """Write a human-readable log to submission_logs/ and a JSON run spec to workspace/run_specs/. Returns the spec path."""
     print('logging user code')
     os.makedirs(log_dir, exist_ok=True)
@@ -111,7 +111,7 @@ def log_submission(user_code, user, log_dir, full_run):
     # JSON run spec for the job to read
     spec_path = os.path.join(SPEC_DIR, f"{base}.json")
     with open(spec_path, 'w') as f:
-        json.dump({'user': user, 'code': user_code, 'full_run': full_run}, f)
+        json.dump({'user': user, 'code': user_code, 'full_run': full_run, 'use_holdout': use_holdout}, f)
 
     return spec_path
 
@@ -202,7 +202,7 @@ def _trigger_vertex_job(json_file_path):
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def run_submission(user_code, user, log_dir, full_run, use_vertex=False):
+def run_submission(user_code, user, log_dir, full_run, use_vertex=False, use_holdout=False):
     """
     Top-level entry point called from app.py.
     Logs submission, validates code synchronously, triggers the job,
@@ -226,6 +226,17 @@ def run_submission(user_code, user, log_dir, full_run, use_vertex=False):
         message += f' Warning: full_run expected to be True/False; instead got {full_run}. Defaulting to False.'
         full_run = False
 
+    if isinstance(use_holdout, bool):
+        pass
+    elif use_holdout is None or not isinstance(use_holdout, str):
+        use_holdout = False
+    elif use_holdout.lower() == 'true':
+        use_holdout = True
+    elif use_holdout.lower() == 'false':
+        use_holdout = False
+    else:
+        use_holdout = False
+
     if full_run and (not ALLOW_FULL_RUN):
         message += ' Warning: full_run not yet permitted; overriding to False.'
         full_run = False
@@ -246,7 +257,7 @@ def run_submission(user_code, user, log_dir, full_run, use_vertex=False):
                 ),
             }, 429
     print('logging submission')
-    json_file_path = log_submission(user_code, user, log_dir, full_run)
+    json_file_path = log_submission(user_code, user, log_dir, full_run, use_holdout)
     print('logged submission')
     _trigger_vertex_job(json_file_path)
     print('triggered job')
@@ -279,7 +290,8 @@ def execute():
         data['user'],
         LOG_DIR,
         data.get('full_run', False),
-        data.get('use_vertex', False)
+        data.get('use_vertex', False),
+        data.get('use_holdout', False),
     )
 
 @app.route('/get_counters', methods=['GET'])

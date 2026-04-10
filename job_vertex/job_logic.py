@@ -1,4 +1,5 @@
 import datetime
+import inspect
 import os
 import smtplib
 import time
@@ -260,13 +261,17 @@ def _format_email(result):
     def fmt_metric(m):
         return f"{m['mean']:.4f}  (95% CI: {m['ci_low']:.4f} – {m['ci_high']:.4f})"
 
+    use_holdout = result.get('use_holdout', False)
+
     def fmt_model_results(results):
         lines = []
         for model_name, metrics in results.items():
             lines.append(f"  {model_name}")
-            lines.append(f"    R²:       {fmt_metric(metrics['r2'])}")
+            label_r2 = "Holdout R²" if use_holdout else "R²"
+            label_sp = "Holdout Spearman" if use_holdout else "Spearman"
+            lines.append(f"    {label_r2}:       {fmt_metric(metrics['r2'])}")
             lines.append(f"    Pearson:  {fmt_metric(metrics['pearson'])}")
-            lines.append(f"    Spearman: {fmt_metric(metrics['spearman'])}")
+            lines.append(f"    {label_sp}: {fmt_metric(metrics['spearman'])}")
         return lines
 
     subject = 'Featurization Run — Results Ready'
@@ -305,17 +310,17 @@ def _send_email(to_address, result):
 # Google Sheets
 # ---------------------------------------------------------------------------
 
-def _log_to_sheet(name, user, timestamp, r2, spearman, feat_rt, model_rt, result_type, model_type):
+def _log_to_sheet(name, user, timestamp, r2, spearman, feat_rt, model_rt, result_type, model_type, holdout_r2=None, holdout_spearman=None):
     """Append one row to the Google Sheet. Silently logs and returns on any failure."""
     print('logging to sheet')
     creds, _ = google.auth.default(
         scopes=['https://www.googleapis.com/auth/spreadsheets']
     )
     service = build('sheets', 'v4', credentials=creds)
-    row = [name, user, timestamp, r2, spearman, feat_rt, model_rt, result_type, model_type]
+    row = [name, user, timestamp, r2, spearman, holdout_r2, holdout_spearman, feat_rt, model_rt, result_type, model_type]
     service.spreadsheets().values().append(
         spreadsheetId=SHEET_ID,
-        range=f"'{SHEET_TAB}'!A:H",
+        range=f"'{SHEET_TAB}'!A:K",
         valueInputOption='USER_ENTERED',
         insertDataOption='INSERT_ROWS',
         body={'values': [row]},
@@ -465,6 +470,74 @@ def _run_cv_evaluation(features, consumption, full_run, name=None):
     return all_results
 
 
+def _run_holdout_evaluation(features, consumption, full_run, holdout_ids, name=None):
+    """
+    Tune hyperparameters via inner CV on non-holdout subscribers, train on all
+    non-holdout, evaluate on holdout. Returns bootstrapped metrics per model.
+    """
+    if name is None:
+        name = ''
+    merged = features.join(consumption, how='inner')
+    merged = merged.dropna(subset='log_consumption')
+
+    holdout_mask = merged.index.isin(holdout_ids)
+    X_train = merged.loc[~holdout_mask, features.columns]
+    y_train = merged.loc[~holdout_mask, consumption.name]
+    X_holdout = merged.loc[holdout_mask, features.columns]
+    y_holdout = merged.loc[holdout_mask, consumption.name]
+
+    lasso_pipeline = Pipeline([
+        ('drop_all_nan', DropAllNaNColumns()),
+        ('scaler', StandardScaler()),
+        ('imputer', SimpleImputer()),
+        ('model', Lasso(random_state=RANDOM_SEED, max_iter=10000)),
+    ])
+    ridge_pipeline = Pipeline([
+        ('drop_all_nan', DropAllNaNColumns()),
+        ('scaler', StandardScaler()),
+        ('imputer', SimpleImputer()),
+        ('model', Ridge(random_state=RANDOM_SEED, max_iter=10000)),
+    ])
+    rf_pipeline = Pipeline([
+        ('drop_all_nan', DropAllNaNColumns()),
+        ('scaler', StandardScaler()),
+        ('imputer', SimpleImputer()),
+        ('model', RandomForestRegressor(random_state=RANDOM_SEED, n_jobs=-1)),
+    ])
+
+    inner_kf = KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+    all_results = {}
+
+    print(f'starting holdout lasso: {datetime.datetime.now(PACIFIC)}, {name}')
+    gs = GridSearchCV(lasso_pipeline, LASSO_PARAM_GRID, cv=inner_kf, n_jobs=-1, verbose=0)
+    gs.fit(X_train, y_train)
+    all_results['Lasso'] = _bootstrap_metrics(y_holdout.values, gs.best_estimator_.predict(X_holdout))
+
+    print(f'starting holdout ridge: {datetime.datetime.now(PACIFIC)}, {name}')
+    gs = GridSearchCV(ridge_pipeline, RIDGE_PARAM_GRID, cv=inner_kf, n_jobs=-1, verbose=0)
+    gs.fit(X_train, y_train)
+    all_results['Ridge'] = _bootstrap_metrics(y_holdout.values, gs.best_estimator_.predict(X_holdout))
+
+    if full_run:
+        print(f'starting holdout rf: {datetime.datetime.now(PACIFIC)}, {name}')
+        gs = GridSearchCV(rf_pipeline, RF_PARAM_GRID, cv=inner_kf, n_jobs=-1, verbose=0)
+        gs.fit(X_train, y_train)
+        all_results['Random Forest'] = _bootstrap_metrics(y_holdout.values, gs.best_estimator_.predict(X_holdout))
+
+        print(f'starting holdout NN: {datetime.datetime.now(PACIFIC)}, {name}')
+        scaler = StandardScaler().fit(X_train.values)
+        X_train_s = np.nan_to_num(scaler.transform(X_train.values))
+        X_holdout_s = np.nan_to_num(scaler.transform(X_holdout.values))
+        y_train_arr = y_train.values
+        best_params = TORCH_LIGHT_PARAMS if NN_LIGHT_MODE else _torch_inner_cv(X_train_s, y_train_arr, TORCH_GRID, inner_kf)
+        model = _TorchRegressorWrapper(X_train_s.shape[1], **best_params)
+        model.fit(X_train_s, y_train_arr)
+        all_results['Neural Net'] = _bootstrap_metrics(y_holdout.values, model.predict(X_holdout_s))
+
+    print(f'done holdout {datetime.datetime.now(PACIFIC)}, {name}')
+    return all_results
+
+
 def _execute_code(user_code):
     """Execute user-submitted code and return the Featurizer class it defines."""
     namespace = {}
@@ -482,7 +555,7 @@ def _execute_code(user_code):
         }
 
 
-def run_job(user_code, user, data_dir, full_run):
+def run_job(user_code, user, data_dir, full_run, use_holdout=False):
     """
     Run the full evaluation pipeline for a submitted featurizer.
 
@@ -497,12 +570,12 @@ def run_job(user_code, user, data_dir, full_run):
         _send_email(user, error)
         return error
 
-    result = evaluate_featurizer(FeaturizerClass, data_dir, user=user, full_run=full_run)
+    result = evaluate_featurizer(FeaturizerClass, data_dir, user=user, full_run=full_run, use_holdout=use_holdout)
     _send_email(user, result)
     return result
 
 
-def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run):
+def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=False):
     """
     Load data from data_dir, instantiate FeaturizerClass, run featurize(),
     validate the output, and evaluate features against consumption.
@@ -545,8 +618,10 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run):
             if not isinstance(name, str):
                 name = ''
 
-        feat_start = time.time()
-        user_features = featurizer.featurize(
+        consumption = togo_dfs['combined_real_consumption']['log_consumption']
+        cider_features = togo_dfs['cider_features']
+
+        featurize_kwargs = dict(
             cdr=togo_dfs['combined_real_cdr'],
             mobile_money=togo_dfs['combined_real_mobile_money'],
             mobile_data=togo_dfs['combined_real_mobile_data'],
@@ -554,36 +629,65 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run):
             antennas=togo_dfs['combined_real_antennas'],
             shapefiles=togo_dfs['shapefiles'],
         )
+
+        if use_holdout:
+            holdout_path = os.path.join(data_dir, 'togo_full_2018_10', 'hold_out_subscribers.csv')
+            holdout_ids = set(pd.read_csv(holdout_path)['subscriber_id'])
+            train_consumption = consumption[~consumption.index.isin(holdout_ids)]
+            if 'consumption' in inspect.signature(featurizer.featurize).parameters:
+                featurize_kwargs['consumption'] = train_consumption
+
+        feat_start = time.time()
+        user_features = featurizer.featurize(**featurize_kwargs)
         feat_rt = round(time.time() - feat_start, 2)
 
         if not isinstance(user_features, pd.DataFrame):
             return {'success': False, 'error': 'featurize must return a pandas DataFrame'}
 
-        consumption = togo_dfs['combined_real_consumption']['log_consumption']
-        cider_features = togo_dfs['cider_features']
+        merged_features = user_features.join(cider_features, how='outer')
+
+        timestamp = datetime.datetime.now(PACIFIC).isoformat(timespec='seconds')
+
+        if use_holdout:
+            cv_start = time.time()
+            results_alone = _run_holdout_evaluation(user_features, consumption, full_run, holdout_ids, 'user only')
+            model_rt_alone = round(time.time() - cv_start, 2)
+
+            cv_start = time.time()
+            results_merged = _run_holdout_evaluation(merged_features, consumption, full_run, holdout_ids, 'merged with existing')
+            model_rt_merged = round(time.time() - cv_start, 2)
+
+            best_alone_model = max(results_alone, key=lambda m: results_alone[m]['r2']['mean'])
+            best_merged_model = max(results_merged, key=lambda m: results_merged[m]['r2']['mean'])
+
+            _log_to_sheet(name, user, timestamp,
+                          None, None,
+                          feat_rt, model_rt_alone, 'user only', best_alone_model,
+                          holdout_r2=results_alone[best_alone_model]['r2']['mean'],
+                          holdout_spearman=results_alone[best_alone_model]['spearman']['mean'])
+            _log_to_sheet(name, user, timestamp,
+                          None, None,
+                          feat_rt, model_rt_merged, 'merged with existing', best_merged_model,
+                          holdout_r2=results_merged[best_merged_model]['r2']['mean'],
+                          holdout_spearman=results_merged[best_merged_model]['spearman']['mean'])
+
+            return {
+                'success': True,
+                'use_holdout': True,
+                'results_user_features_only': results_alone,
+                'results_merged_with_existing': results_merged,
+            }
 
         cv_start = time.time()
         results_alone = _run_cv_evaluation(user_features, consumption, full_run, 'user only')
         model_rt_alone = round(time.time() - cv_start, 2)
 
-        merged_features = user_features.join(cider_features, how='outer')
         cv_start = time.time()
         results_merged = _run_cv_evaluation(merged_features, consumption, full_run, 'merged with existing')
         model_rt_merged = round(time.time() - cv_start, 2)
 
-        timestamp = datetime.datetime.now(PACIFIC).isoformat(timespec='seconds')
-
-        best_alone_r2, best_alone_model = -np.inf, None
-        for model_type, results in results_alone.items():
-            if results['r2']['mean'] > best_alone_r2:
-                best_alone_r2 = results['r2']['mean']
-                best_alone_model = model_type
-
-        best_merged_r2, best_merged_model = -np.inf, None
-        for model_type, results in results_merged.items():
-            if results['r2']['mean'] > best_merged_r2:
-                best_merged_r2 = results['r2']['mean']
-                best_merged_model = model_type
+        best_alone_model = max(results_alone, key=lambda m: results_alone[m]['r2']['mean'])
+        best_merged_model = max(results_merged, key=lambda m: results_merged[m]['r2']['mean'])
 
         _log_to_sheet(name, user, timestamp,
                       results_alone[best_alone_model]['r2']['mean'],
