@@ -10,3 +10,5 @@ google-auth>=2.0.0
 torch==2.0.1+cpu
 pyarrow>=14.0.0
 sktime>=0.26.0
+lightgbm>=4.0.0
+optuna>=3.0.0

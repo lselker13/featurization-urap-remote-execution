@@ -11,7 +11,7 @@ import sys
 
 from job_logic import run_job
 
-DATA_DIR = os.environ.get('DATA_DIR', '/data/togo')
+DATA_DIR = os.environ.get('DATA_DIR', '/data')
 
 
 def main():

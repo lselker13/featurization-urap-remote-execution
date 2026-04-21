@@ -27,6 +27,8 @@ steps:
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - build
+      - -f
+      - job_vertex/Dockerfile
       - -t
       - ${IMAGE_URI}
       - .
@@ -37,12 +39,27 @@ YAML
 echo "Uploading service account key to GCS..."
 PROJECT_NUMBER=$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')
 SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+
+echo "Deleting existing service account keys..."
+gcloud iam service-accounts keys list \
+  --iam-account="$SA" \
+  --managed-by=user \
+  --format="value(name)" \
+  --project="$PROJECT" \
+| while read -r key_id; do
+    echo "  Deleting key: $key_id"
+    gcloud iam service-accounts keys delete "$key_id" \
+      --iam-account="$SA" \
+      --project="$PROJECT" \
+      --quiet
+  done
+
 gcloud iam service-accounts keys create /tmp/sa-key.json --iam-account="$SA"
 gsutil cp /tmp/sa-key.json gs://featurization-test-bucket/sa-key.json
 rm /tmp/sa-key.json
 
 echo "Building and pushing image..."
-gcloud builds submit job_vertex/ \
+gcloud builds submit . \
   --config="$CLOUDBUILD_CONFIG" \
   --project="$PROJECT"
 rm "$CLOUDBUILD_CONFIG"

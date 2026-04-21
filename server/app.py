@@ -157,7 +157,7 @@ def _trigger_vertex_job(json_file_path):
     """Trigger a Vertex AI Custom Job, passing the submission JSON path via env var."""
     region = os.environ.get('JOB_REGION', 'us-central1')
     image_uri = os.environ.get('IMAGE_URI', 'us-central1-docker.pkg.dev/gol-cdr-featurization-comp/featurization-jobs/featurization-evaluator-vertex:latest')
-    machine_type = os.environ.get('MACHINE_TYPE', 'n1-highmem-16')
+    machine_type = os.environ.get('MACHINE_TYPE', 'n1-highmem-32')
     gmail_password = os.environ.get('GMAIL_APP_PASSWORD', '')
     print('Fetching credentials')
 
@@ -266,7 +266,7 @@ def run_submission(user_code, user, log_dir, full_run, use_vertex=False, use_hol
         new_count = _increment_full_run_count(safe, year, week)
         print(f'Rate limit counter for {safe} week {year}-W{week:02d}: {new_count}/{FULL_RUN_WEEKLY_LIMIT}')
 
-    return {'success': True, 'message': message.strip() + f"full run: {full_run}"}, 202
+    return {'success': True, 'message': message.strip() + f" Full run: {full_run}."}, 202
 
 
 # ---------------------------------------------------------------------------

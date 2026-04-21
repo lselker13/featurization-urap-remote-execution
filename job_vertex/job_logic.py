@@ -19,9 +19,12 @@ from sklearn.exceptions import ConvergenceWarning
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import Lasso, Ridge
 from sklearn.metrics import r2_score
-from sklearn.model_selection import GridSearchCV, KFold, ParameterGrid
+from sklearn.model_selection import GridSearchCV, KFold, ParameterGrid, RandomizedSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+
+import lightgbm as lgb
+import optuna
 
 import torch
 import torch.nn as nn
@@ -50,18 +53,23 @@ N_BOOT = 20
 LASSO_PARAM_GRID = {"model__alpha": list(np.logspace(-4, 1, 7))}
 RIDGE_PARAM_GRID = {"model__alpha": list(np.logspace(-4, 1, 7))}
 
-# Fix: corrected parameter name (n_estimators, not num_estimators) and added
-# missing comma that caused a SyntaxError in the original.
 RF_PARAM_GRID = {
-    "model__n_estimators": [50, 100, 500],
-    "model__max_depth": [None, 3, 10, 20],
+    "model__n_estimators": [50, 100, 200, 500, 1000],
+    "model__max_depth": [2, 3, 5, 10, 20],
     "model__min_samples_split": [2, 5, 10],
     "model__min_samples_leaf": [1, 2, 5],
     "model__max_features": ["sqrt", "log2", 0.5],
 }
+RF_N_ITER = 40  # RandomizedSearchCV samples (vs 375 exhaustive combinations)
 
-# Extended patience values so early stopping has enough budget to distinguish
-# genuine plateaus from epoch-to-epoch validation noise.
+LGBM_N_TRIALS = 100  # Optuna trials per outer fold, matching the notebook
+LGBM_SEARCH_BOUNDS = {
+    'learning_rate':     (0.01, 0.5),
+    'max_depth':         (1, 10),
+    'num_leaves':        (5, 60),
+    'min_child_samples': (10, 500),
+}
+
 TORCH_GRID = list(ParameterGrid({
     "lr": [1e-3, 3e-4],
     "weight_decay": [1e-3, 1e-5],
@@ -107,7 +115,7 @@ class _TorchRegressorWrapper:
         self.patience = patience
         self.loss_fn = nn.MSELoss()
 
-    def fit(self, X, y, val_frac=0.15, batch_size=64):
+    def fit(self, X, y, val_frac=0.15, batch_size=64, sample_weight=None):
         # Initialise the output bias to the training mean so the network starts
         # predicting at the correct scale.  Without this the bias is near 0
         # while log_consumption has mean ~6.5.  Adam's per-parameter gradient
@@ -126,22 +134,47 @@ class _TorchRegressorWrapper:
         X_val_t = torch.tensor(X[val_idx], dtype=torch.float32).to(self.device)
         y_val_t = torch.tensor(y[val_idx], dtype=torch.float32).unsqueeze(1).to(self.device)
 
-        loader = torch.utils.data.DataLoader(
-            torch.utils.data.TensorDataset(X_train_t, y_train_t), batch_size=batch_size, shuffle=True
-        )
+        if sample_weight is not None:
+            sw_train = sample_weight[train_idx]
+            sw_train = sw_train / sw_train.mean()
+            sw_train_t = torch.tensor(sw_train, dtype=torch.float32).unsqueeze(1)
+            sw_val = sample_weight[val_idx]
+            sw_val = sw_val / sw_val.mean()
+            sw_val_t = torch.tensor(sw_val, dtype=torch.float32).unsqueeze(1).to(self.device)
+            dataset = torch.utils.data.TensorDataset(X_train_t, y_train_t, sw_train_t)
+        else:
+            sw_val_t = None
+            dataset = torch.utils.data.TensorDataset(X_train_t, y_train_t)
+
+        loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
         best_loss, patience_left, best_state = float('inf'), self.patience, None
 
         for epoch in range(self.epochs):
             self.model.train()
-            for X_b, y_b in loader:
-                X_b, y_b = X_b.to(self.device), y_b.to(self.device)
-                self.opt.zero_grad()
-                self.loss_fn(self.model(X_b), y_b).backward()
+            for batch in loader:
+                if sample_weight is not None:
+                    X_b, y_b, sw_b = batch
+                    X_b = X_b.to(self.device)
+                    y_b = y_b.to(self.device)
+                    sw_b = sw_b.to(self.device)
+                    self.opt.zero_grad()
+                    pred = self.model(X_b)
+                    loss = (sw_b * (pred - y_b) ** 2).mean()
+                else:
+                    X_b, y_b = batch
+                    X_b, y_b = X_b.to(self.device), y_b.to(self.device)
+                    self.opt.zero_grad()
+                    loss = self.loss_fn(self.model(X_b), y_b)
+                loss.backward()
                 self.opt.step()
 
             self.model.eval()
             with torch.no_grad():
-                val_loss = self.loss_fn(self.model(X_val_t), y_val_t).item()
+                pred_val = self.model(X_val_t)
+                if sw_val_t is not None:
+                    val_loss = (sw_val_t * (pred_val - y_val_t) ** 2).mean().item()
+                else:
+                    val_loss = self.loss_fn(pred_val, y_val_t).item()
             if val_loss < best_loss:
                 best_loss = val_loss
                 patience_left = self.patience
@@ -187,34 +220,47 @@ def _bootstrap_metrics(y_true, y_pred):
     return results
 
 
-def _cv_sklearn(X, y, pipeline, param_grid, outer_kf, inner_kf, model_type_name='unspecified'):
-    """Nested CV for sklearn pipelines; returns pooled (y_true, y_pred) arrays."""
+def _cv_sklearn(X, y, pipeline, param_grid, outer_kf, inner_kf, model_type_name='unspecified', sample_weight=None, n_iter=None):
+    """Nested CV for sklearn pipelines; returns (y_true, y_pred, params_per_fold).
+
+    If n_iter is given, uses RandomizedSearchCV instead of GridSearchCV.
+    """
     fold_preds = []
+    params_per_fold = []
     for i, (train_idx, test_idx) in enumerate(outer_kf.split(X)):
         print(f'running grid search fold {i} for model type {model_type_name}')
-        gs = GridSearchCV(pipeline, param_grid, cv=inner_kf, n_jobs=-1, verbose=0)
-        gs.fit(X.iloc[train_idx], y.iloc[train_idx])
+        if n_iter is not None:
+            gs = RandomizedSearchCV(pipeline, param_grid, n_iter=n_iter, cv=inner_kf,
+                                    n_jobs=-1, verbose=0, random_state=RANDOM_SEED)
+        else:
+            gs = GridSearchCV(pipeline, param_grid, cv=inner_kf, n_jobs=-1, verbose=0)
+        fit_params = {}
+        if sample_weight is not None:
+            fit_params['model__sample_weight'] = sample_weight[train_idx]
+        gs.fit(X.iloc[train_idx], y.iloc[train_idx], **fit_params)
         fold_preds.append((y.iloc[test_idx].values, gs.best_estimator_.predict(X.iloc[test_idx])))
+        params_per_fold.append(gs.best_params_)
     y_true = np.concatenate([t for t, _ in fold_preds])
     y_pred = np.concatenate([p for _, p in fold_preds])
-    return y_true, y_pred
+    return y_true, y_pred, params_per_fold
 
 
-def _torch_inner_cv(X, y, param_grid, inner_kf):
+def _torch_inner_cv(X, y, param_grid, inner_kf, sample_weight=None):
     """Inner CV for torch hyperparameter selection."""
     best_params, best_score = None, -np.inf
     for params in param_grid:
         scores = []
         for tr, va in inner_kf.split(X):
             m = _TorchRegressorWrapper(X.shape[1], **params)
-            m.fit(X[tr], y[tr])
+            sw_tr = sample_weight[tr] if sample_weight is not None else None
+            m.fit(X[tr], y[tr], sample_weight=sw_tr)
             scores.append(r2_score(y[va], m.predict(X[va])))
         if np.mean(scores) > best_score:
             best_score, best_params = np.mean(scores), params
     return best_params
 
 
-def _cv_torch(X, y, param_grid, outer_kf, inner_kf, light=False):
+def _cv_torch(X, y, param_grid, outer_kf, inner_kf, light=False, sample_weight=None):
     """Nested CV for the torch MLP; scales inside each outer fold.
 
     If light=True, skips inner CV and uses TORCH_LIGHT_PARAMS directly (~18x faster).
@@ -225,19 +271,175 @@ def _cv_torch(X, y, param_grid, outer_kf, inner_kf, light=False):
     for train_idx, test_idx in outer_kf.split(X_arr):
         X_train, X_test = X_arr[train_idx], X_arr[test_idx]
         y_train, y_test = y_arr[train_idx], y_arr[test_idx]
+        sw_train = sample_weight[train_idx] if sample_weight is not None else None
         scaler = StandardScaler()
         X_train_s = scaler.fit_transform(X_train)
         X_test_s = scaler.transform(X_test)
         # Replace NaN/inf that may remain after scaling
         X_train_s = np.nan_to_num(X_train_s)
         X_test_s = np.nan_to_num(X_test_s)
-        best_params = TORCH_LIGHT_PARAMS if light else _torch_inner_cv(X_train_s, y_train, param_grid, inner_kf)
+        if light:
+            best_params = TORCH_LIGHT_PARAMS
+        else:
+            best_params = _torch_inner_cv(X_train_s, y_train, param_grid, inner_kf, sample_weight=sw_train)
         model = _TorchRegressorWrapper(X_train_s.shape[1], **best_params)
-        model.fit(X_train_s, y_train)
+        model.fit(X_train_s, y_train, sample_weight=sw_train)
         fold_preds.append((y_test, model.predict(X_test_s)))
     y_true = np.concatenate([t for t, _ in fold_preds])
     y_pred = np.concatenate([p for _, p in fold_preds])
     return y_true, y_pred
+
+
+# ---------------------------------------------------------------------------
+# LightGBM with Optuna tuning
+# ---------------------------------------------------------------------------
+
+def _lgbm_make_objective(X_outer_train, y_outer_train, inner_kf, sample_weight=None):
+    """Return an Optuna objective that does inner-CV R² for LightGBM."""
+    def objective(trial):
+        params = {
+            'n_estimators':      1000,
+            'learning_rate':     trial.suggest_float('learning_rate', 0.01, 0.5, log=True),
+            'max_depth':         trial.suggest_int('max_depth', 1, 10),
+            'num_leaves':        trial.suggest_int('num_leaves', 5, 60),
+            'min_child_samples': trial.suggest_int('min_child_samples', 10, 500, log=True),
+            'random_state':      RANDOM_SEED,
+            'verbose':           -1,
+        }
+        inner_scores = []
+        for tr, va in inner_kf.split(X_outer_train):
+            model = lgb.LGBMRegressor(**params)
+            sw_tr = sample_weight[tr] if sample_weight is not None else None
+            model.fit(
+                X_outer_train[tr], y_outer_train[tr],
+                sample_weight=sw_tr,
+                eval_set=[(X_outer_train[va], y_outer_train[va])],
+                callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
+            )
+            inner_scores.append(r2_score(y_outer_train[va], model.predict(X_outer_train[va])))
+        return float(np.mean(inner_scores))
+    return objective
+
+
+def _cv_lgbm(X, y, outer_kf, inner_kf, n_trials=LGBM_N_TRIALS, sample_weight=None):
+    """Nested CV for LightGBM with Optuna inner tuning; returns (y_true, y_pred, params_per_fold)."""
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    X_arr = X.values if hasattr(X, 'values') else np.asarray(X)
+    y_arr = y if isinstance(y, np.ndarray) else np.asarray(y)
+    fold_preds = []
+    params_per_fold = []
+    for outer_fold, (train_idx, test_idx) in enumerate(outer_kf.split(X_arr)):
+        print(f'  lgbm outer fold {outer_fold}')
+        X_outer_train, X_outer_test = X_arr[train_idx], X_arr[test_idx]
+        y_outer_train, y_outer_test = y_arr[train_idx], y_arr[test_idx]
+        sw_outer_train = sample_weight[train_idx] if sample_weight is not None else None
+        # Drop columns that are entirely NaN in the training split
+        keep = np.where(~np.all(np.isnan(X_outer_train), axis=0))[0]
+        X_outer_train, X_outer_test = X_outer_train[:, keep], X_outer_test[:, keep]
+        study = optuna.create_study(
+            direction='maximize',
+            sampler=optuna.samplers.TPESampler(seed=RANDOM_SEED),
+        )
+        study.optimize(_lgbm_make_objective(X_outer_train, y_outer_train, inner_kf, sw_outer_train), n_trials=n_trials)
+        best = study.best_params
+        params_per_fold.append(best)
+        final_model = lgb.LGBMRegressor(n_estimators=1000, random_state=RANDOM_SEED, verbose=-1, **best)
+        final_model.fit(X_outer_train, y_outer_train, sample_weight=sw_outer_train)
+        fold_preds.append((y_outer_test, final_model.predict(X_outer_test)))
+    y_true = np.concatenate([t for t, _ in fold_preds])
+    y_pred = np.concatenate([p for _, p in fold_preds])
+    return y_true, y_pred, params_per_fold
+
+
+def _lgbm_holdout(X_train, y_train, X_holdout, y_holdout, inner_kf, n_trials=LGBM_N_TRIALS, sample_weight=None):
+    """Optuna-tuned LightGBM trained on non-holdout, evaluated on holdout. Returns (y_ho, preds, best_params)."""
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    X_tr = X_train.values if hasattr(X_train, 'values') else np.asarray(X_train)
+    y_tr = y_train.values if hasattr(y_train, 'values') else np.asarray(y_train)
+    X_ho = X_holdout.values if hasattr(X_holdout, 'values') else np.asarray(X_holdout)
+    y_ho = y_holdout.values if hasattr(y_holdout, 'values') else np.asarray(y_holdout)
+    keep = np.where(~np.all(np.isnan(X_tr), axis=0))[0]
+    X_tr, X_ho = X_tr[:, keep], X_ho[:, keep]
+    study = optuna.create_study(
+        direction='maximize',
+        sampler=optuna.samplers.TPESampler(seed=RANDOM_SEED),
+    )
+    study.optimize(_lgbm_make_objective(X_tr, y_tr, inner_kf, sample_weight), n_trials=n_trials)
+    best = study.best_params
+    final_model = lgb.LGBMRegressor(n_estimators=1000, random_state=RANDOM_SEED, verbose=-1, **best)
+    final_model.fit(X_tr, y_tr, sample_weight=sample_weight)
+    return y_ho, final_model.predict(X_ho), best
+
+
+# ---------------------------------------------------------------------------
+# Hyperparameter logging
+# ---------------------------------------------------------------------------
+
+def _rf_boundary_warnings(params):
+    """Return list of boundary-warning strings for a single RF best_params_ dict."""
+    msgs = []
+    for key, values in RF_PARAM_GRID.items():
+        v = params.get(key)
+        numeric = [x for x in values if isinstance(x, (int, float))]
+        # Need at least two numeric values to have a meaningful boundary
+        if len(numeric) < 2 or v is None or not isinstance(v, (int, float)):
+            continue
+        if v == min(numeric):
+            msgs.append(f"{key.replace('model__', '')}={v} (at low boundary)")
+        elif v == max(numeric):
+            msgs.append(f"{key.replace('model__', '')}={v} (at high boundary)")
+    return msgs
+
+
+def _lgbm_boundary_warnings(params):
+    """Return list of boundary-warning strings for a single Optuna best_params dict."""
+    msgs = []
+    for k, (lo, hi) in LGBM_SEARCH_BOUNDS.items():
+        v = params.get(k)
+        if v is None:
+            continue
+        at_lo = (v == lo) if isinstance(v, int) else (v <= lo * 1.01)
+        at_hi = (v == hi) if isinstance(v, int) else (v >= hi * 0.99)
+        if at_lo:
+            msgs.append(f"{k}={v:.4g} (near low boundary of {lo})")
+        elif at_hi:
+            msgs.append(f"{k}={v:.4g} (near high boundary of {hi})")
+    return msgs
+
+
+def _format_hp_log(label, rf_params_per_fold, lgbm_params_per_fold):
+    """Return a human-readable string of HP details for one evaluation context, or '' if none."""
+    if not rf_params_per_fold and not lgbm_params_per_fold:
+        return ''
+    lines = [f'[{label}]']
+
+    if rf_params_per_fold:
+        lines.append('  Random Forest:')
+        fold_warnings = []
+        for i, params in enumerate(rf_params_per_fold):
+            nice = {k.replace('model__', ''): v for k, v in params.items()}
+            lines.append('    Fold {}: {}'.format(i + 1, ', '.join(f'{k}={v}' for k, v in nice.items())))
+            w = _rf_boundary_warnings(params)
+            if w:
+                fold_warnings.append('    Fold {}: {}'.format(i + 1, '; '.join(w)))
+        if fold_warnings:
+            lines.append('    Boundary warnings:')
+            lines.extend(fold_warnings)
+
+    if lgbm_params_per_fold:
+        lines.append('  LightGBM:')
+        fold_warnings = []
+        for i, params in enumerate(lgbm_params_per_fold):
+            parts = [f'{k}={v:.4g}' if isinstance(v, float) else f'{k}={v}' for k, v in params.items()]
+            lines.append('    Fold {}: {}'.format(i + 1, ', '.join(parts)))
+            w = _lgbm_boundary_warnings(params)
+            if w:
+                fold_warnings.append('    Fold {}: {}'.format(i + 1, '; '.join(w)))
+        if fold_warnings:
+            lines.append('    Boundary warnings:')
+            lines.extend(fold_warnings)
+
+    return '\n'.join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +483,17 @@ def _format_email(result):
     lines.append('')
     lines.append('=== Merged with Existing Features ===')
     lines.extend(fmt_model_results(result.get('results_merged_with_existing', {})))
+
+    hp_alone = result.get('hp_log_user_only', '')
+    hp_merged = result.get('hp_log_merged', '')
+    if hp_alone or hp_merged:
+        lines.append('')
+        lines.append('=== Hyperparameter Details: Generally fine to ignore ===')
+        if hp_alone:
+            lines.append(hp_alone)
+        if hp_merged:
+            lines.append(hp_merged)
+
     return subject, '\n'.join(lines)
 
 
@@ -375,33 +588,45 @@ def _update_leaderboard(sheet_tab, name, user, timestamp, r2, model_type):
 # ---------------------------------------------------------------------------
 
 def load_data(data_dir):
-    folder_path = os.path.join(data_dir, 'togo_full_2018_10')
+    real_data = os.path.join(data_dir, 'togo_2018_oct_dec', 'real_data')
     togo_dfs = {}
 
-    for csv_file in [f for f in os.listdir(folder_path) if f.endswith('.csv')]:
-        df = pd.read_csv(os.path.join(folder_path, csv_file))
-        if "consumption" in csv_file:
-            df['log_consumption'] = np.log1p(df['consumption'])
-            df.drop_duplicates('phone_number', keep='first', inplace=True)
-            df.index = df["phone_number"]
-            df.drop(columns=["phone_number"], inplace=True)
-            togo_dfs['consumption'] = df
-        togo_dfs[os.path.splitext(csv_file)[0]] = df
+    # Survey outcomes: phone_number, weight, consumption
+    survey = pd.read_csv(os.path.join(real_data, 'survey2018outcomes_no_duplicates.csv'))
+    survey['log_consumption'] = np.log1p(survey['consumption'])
+    survey.drop_duplicates('phone_number', keep='first', inplace=True)
+    survey.index = survey['phone_number']
+    survey.drop(columns=['phone_number'], inplace=True)
+    togo_dfs['combined_real_consumption'] = survey  # columns: weight, consumption, log_consumption
 
+    # CDR (partitioned parquet directory)
+    togo_dfs['combined_real_cdr'] = pd.read_parquet(os.path.join(real_data, 'cdr'))
+
+    # Mobile money (partitioned parquet directory)
+    togo_dfs['combined_real_mobile_money'] = pd.read_parquet(os.path.join(real_data, 'mobile_money'))
+
+    # Mobile data (partitioned parquet directory)
+    togo_dfs['combined_real_mobile_data'] = pd.read_parquet(os.path.join(real_data, 'mobile_data'))
+
+    # Antennas
+    togo_dfs['combined_real_antennas'] = pd.read_csv(os.path.join(real_data, 'antennas.csv'))
+
+    # Existing CIDER features
     if LOAD_EXISTING_FEATURES:
-        df = pd.read_parquet(os.path.join(data_dir, 'togo_features_2018_10/features'))
+        df = pd.read_parquet(os.path.join(data_dir, 'togo_2018_oct_dec', 'features'))
         df = df.rename(columns={"name": "phone_number"})
         df.index = df["phone_number"]
         df.drop(columns=["phone_number"], inplace=True)
         togo_dfs['cider_features'] = df
     else:
-        togo_dfs['cider_features'] = pd.DataFrame(index=togo_dfs['consumption'].index)
+        togo_dfs['cider_features'] = pd.DataFrame(index=togo_dfs['combined_real_consumption'].index)
 
-    shapefiles_path = os.path.join(data_dir, 'togo_admin_boundaries')
+    # Shapefiles (GeoJSON)
+    geo_path = os.path.join(real_data, 'geo')
     togo_dfs['shapefiles'] = {}
-    for shapefile in [f for f in os.listdir(shapefiles_path) if f.endswith('.geojson')]:
+    for shapefile in [f for f in os.listdir(geo_path) if f.endswith('.geojson')]:
         name = os.path.splitext(shapefile)[0]
-        togo_dfs['shapefiles'][name] = gpd.read_file(os.path.join(shapefiles_path, shapefile))
+        togo_dfs['shapefiles'][name] = gpd.read_file(os.path.join(geo_path, shapefile))
 
     return togo_dfs
 
@@ -410,21 +635,25 @@ def load_data(data_dir):
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def _run_cv_evaluation(features, consumption, full_run, name=None):
+def _run_cv_evaluation(features, consumption, full_run, sample_weight=None, name=None):
     """
     Run nested CV with Lasso, RF, and NN. Returns bootstrapped metrics per model.
 
-    features:    pd.DataFrame indexed by phone_number
-    consumption: pd.Series of log_consumption indexed by phone_number
+    features:      pd.DataFrame indexed by phone_number
+    consumption:   pd.Series of log_consumption indexed by phone_number
+    sample_weight: pd.Series of survey weights indexed by phone_number (optional)
     """
 
     if name is None:
         name = ''
     merged = features.join(consumption, how='inner')
+    if sample_weight is not None:
+        merged = merged.join(sample_weight.rename('__weight__'), how='left')
     merged = merged.dropna(subset='log_consumption').reset_index(drop=True)
 
     X = merged[features.columns]
     y = merged[consumption.name]
+    sw = merged['__weight__'].values if sample_weight is not None else None
 
     lasso_pipeline = Pipeline([
         ('drop_all_nan', DropAllNaNColumns()),
@@ -451,26 +680,35 @@ def _run_cv_evaluation(features, consumption, full_run, name=None):
     all_results = {}
 
     print(f'starting lasso: {datetime.datetime.now(PACIFIC)}, {name}')
-    y_true, y_pred = _cv_sklearn(X, y, lasso_pipeline, LASSO_PARAM_GRID, outer_kf, inner_kf, 'lasso')
+    y_true, y_pred, _ = _cv_sklearn(X, y, lasso_pipeline, LASSO_PARAM_GRID, outer_kf, inner_kf, 'lasso', sample_weight=sw)
     all_results['Lasso'] = _bootstrap_metrics(y_true, y_pred)
 
     print(f'starting ridge: {datetime.datetime.now(PACIFIC)}, {name}')
-    y_true, y_pred = _cv_sklearn(X, y, ridge_pipeline, RIDGE_PARAM_GRID, outer_kf, inner_kf, 'ridge')
+    y_true, y_pred, _ = _cv_sklearn(X, y, ridge_pipeline, RIDGE_PARAM_GRID, outer_kf, inner_kf, 'ridge', sample_weight=sw)
     all_results['Ridge'] = _bootstrap_metrics(y_true, y_pred)
+
+    rf_params_per_fold = []
+    lgbm_params_per_fold = []
 
     if full_run:
         print(f'starting rf: {datetime.datetime.now(PACIFIC)}, {name}')
-        y_true, y_pred = _cv_sklearn(X, y, rf_pipeline, RF_PARAM_GRID, outer_kf, inner_kf, 'random forest')
+        y_true, y_pred, rf_params_per_fold = _cv_sklearn(X, y, rf_pipeline, RF_PARAM_GRID, outer_kf, inner_kf, 'random forest', sample_weight=sw, n_iter=RF_N_ITER)
         all_results['Random Forest'] = _bootstrap_metrics(y_true, y_pred)
 
         print(f'starting NN: {datetime.datetime.now(PACIFIC)}, {name}')
-        y_true, y_pred = _cv_torch(X, y.values, TORCH_GRID, outer_kf, inner_kf, light=NN_LIGHT_MODE)
+        y_true, y_pred = _cv_torch(X, y.values, TORCH_GRID, outer_kf, inner_kf, light=NN_LIGHT_MODE, sample_weight=sw)
         all_results['Neural Net'] = _bootstrap_metrics(y_true, y_pred)
+
+        print(f'starting lgbm: {datetime.datetime.now(PACIFIC)}, {name}')
+        y_true, y_pred, lgbm_params_per_fold = _cv_lgbm(X, y.values, outer_kf, inner_kf, sample_weight=sw)
+        all_results['LightGBM'] = _bootstrap_metrics(y_true, y_pred)
+
     print(f'done {datetime.datetime.now(PACIFIC)}, {name}')
-    return all_results
+    hp_log = _format_hp_log(name or 'CV', rf_params_per_fold, lgbm_params_per_fold)
+    return all_results, hp_log
 
 
-def _run_holdout_evaluation(features, consumption, full_run, holdout_ids, name=None):
+def _run_holdout_evaluation(features, consumption, full_run, holdout_ids, sample_weight=None, name=None):
     """
     Tune hyperparameters via inner CV on non-holdout subscribers, train on all
     non-holdout, evaluate on holdout. Returns bootstrapped metrics per model.
@@ -478,6 +716,8 @@ def _run_holdout_evaluation(features, consumption, full_run, holdout_ids, name=N
     if name is None:
         name = ''
     merged = features.join(consumption, how='inner')
+    if sample_weight is not None:
+        merged = merged.join(sample_weight.rename('__weight__'), how='left')
     merged = merged.dropna(subset='log_consumption')
 
     holdout_mask = merged.index.isin(holdout_ids)
@@ -485,6 +725,7 @@ def _run_holdout_evaluation(features, consumption, full_run, holdout_ids, name=N
     y_train = merged.loc[~holdout_mask, consumption.name]
     X_holdout = merged.loc[holdout_mask, features.columns]
     y_holdout = merged.loc[holdout_mask, consumption.name]
+    sw_train = merged.loc[~holdout_mask, '__weight__'].values if sample_weight is not None else None
 
     lasso_pipeline = Pipeline([
         ('drop_all_nan', DropAllNaNColumns()),
@@ -510,32 +751,47 @@ def _run_holdout_evaluation(features, consumption, full_run, holdout_ids, name=N
 
     print(f'starting holdout lasso: {datetime.datetime.now(PACIFIC)}, {name}')
     gs = GridSearchCV(lasso_pipeline, LASSO_PARAM_GRID, cv=inner_kf, n_jobs=-1, verbose=0)
-    gs.fit(X_train, y_train)
+    fit_params = {'model__sample_weight': sw_train} if sw_train is not None else {}
+    gs.fit(X_train, y_train, **fit_params)
     all_results['Lasso'] = _bootstrap_metrics(y_holdout.values, gs.best_estimator_.predict(X_holdout))
 
     print(f'starting holdout ridge: {datetime.datetime.now(PACIFIC)}, {name}')
     gs = GridSearchCV(ridge_pipeline, RIDGE_PARAM_GRID, cv=inner_kf, n_jobs=-1, verbose=0)
-    gs.fit(X_train, y_train)
+    gs.fit(X_train, y_train, **fit_params)
     all_results['Ridge'] = _bootstrap_metrics(y_holdout.values, gs.best_estimator_.predict(X_holdout))
+
+    rf_params_per_fold = []
+    lgbm_params_per_fold = []
 
     if full_run:
         print(f'starting holdout rf: {datetime.datetime.now(PACIFIC)}, {name}')
-        gs = GridSearchCV(rf_pipeline, RF_PARAM_GRID, cv=inner_kf, n_jobs=-1, verbose=0)
-        gs.fit(X_train, y_train)
+        gs = RandomizedSearchCV(rf_pipeline, RF_PARAM_GRID, n_iter=RF_N_ITER, cv=inner_kf,
+                                n_jobs=-1, verbose=0, random_state=RANDOM_SEED)
+        gs.fit(X_train, y_train, **fit_params)
         all_results['Random Forest'] = _bootstrap_metrics(y_holdout.values, gs.best_estimator_.predict(X_holdout))
+        rf_params_per_fold = [gs.best_params_]
 
         print(f'starting holdout NN: {datetime.datetime.now(PACIFIC)}, {name}')
         scaler = StandardScaler().fit(X_train.values)
         X_train_s = np.nan_to_num(scaler.transform(X_train.values))
         X_holdout_s = np.nan_to_num(scaler.transform(X_holdout.values))
         y_train_arr = y_train.values
-        best_params = TORCH_LIGHT_PARAMS if NN_LIGHT_MODE else _torch_inner_cv(X_train_s, y_train_arr, TORCH_GRID, inner_kf)
+        if NN_LIGHT_MODE:
+            best_params = TORCH_LIGHT_PARAMS
+        else:
+            best_params = _torch_inner_cv(X_train_s, y_train_arr, TORCH_GRID, inner_kf, sample_weight=sw_train)
         model = _TorchRegressorWrapper(X_train_s.shape[1], **best_params)
-        model.fit(X_train_s, y_train_arr)
+        model.fit(X_train_s, y_train_arr, sample_weight=sw_train)
         all_results['Neural Net'] = _bootstrap_metrics(y_holdout.values, model.predict(X_holdout_s))
 
+        print(f'starting holdout lgbm: {datetime.datetime.now(PACIFIC)}, {name}')
+        y_ho, lgbm_preds, lgbm_best = _lgbm_holdout(X_train, y_train, X_holdout, y_holdout, inner_kf, sample_weight=sw_train)
+        all_results['LightGBM'] = _bootstrap_metrics(y_ho, lgbm_preds)
+        lgbm_params_per_fold = [lgbm_best]
+
     print(f'done holdout {datetime.datetime.now(PACIFIC)}, {name}')
-    return all_results
+    hp_log = _format_hp_log(name or 'Holdout', rf_params_per_fold, lgbm_params_per_fold)
+    return all_results, hp_log
 
 
 def _execute_code(user_code):
@@ -583,8 +839,9 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
     Args:
         FeaturizerClass: A class with a featurize() method.
         data_dir:        Top-level data directory. Expected structure:
-                           {data_dir}/togo/togo_data_2018_10/  — CSVs
-                           {data_dir}/togo_admin_boundaries/   — GeoJSONs
+                           {data_dir}/togo_2018_oct_dec/real_data/  — CSVs and parquet subdirs
+                           {data_dir}/togo_2018_oct_dec/features/   — CIDER feature parquets
+                           {data_dir}/togo_2018_oct_dec/real_data/geo/ — GeoJSONs
 
     Returns:
         dict with keys: success, results_user_features_only,
@@ -619,6 +876,7 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
                 name = ''
 
         consumption = togo_dfs['combined_real_consumption']['log_consumption']
+        weights = togo_dfs['combined_real_consumption']['weight']
         cider_features = togo_dfs['cider_features']
 
         featurize_kwargs = dict(
@@ -631,8 +889,8 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
         )
 
         if use_holdout:
-            holdout_path = os.path.join(data_dir, 'togo_full_2018_10', 'hold_out_subscribers.csv')
-            holdout_ids = set(pd.read_csv(holdout_path)['subscriber_id'])
+            holdout_path = os.path.join(data_dir, 'togo_2018_oct_dec', 'real_data', 'hold_out_subscribers.csv')
+            holdout_ids = set(pd.read_csv(holdout_path)['phone_number'])
             train_consumption = consumption[~consumption.index.isin(holdout_ids)]
             if 'consumption' in inspect.signature(featurizer.featurize).parameters:
                 featurize_kwargs['consumption'] = train_consumption
@@ -650,11 +908,17 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
 
         if use_holdout:
             cv_start = time.time()
-            results_alone = _run_holdout_evaluation(user_features, consumption, full_run, holdout_ids, 'user only')
+            results_alone, hp_log_alone = _run_holdout_evaluation(
+                user_features, consumption, full_run, holdout_ids,
+                sample_weight=weights, name='user only',
+            )
             model_rt_alone = round(time.time() - cv_start, 2)
 
             cv_start = time.time()
-            results_merged = _run_holdout_evaluation(merged_features, consumption, full_run, holdout_ids, 'merged with existing')
+            results_merged, hp_log_merged = _run_holdout_evaluation(
+                merged_features, consumption, full_run, holdout_ids,
+                sample_weight=weights, name='merged with existing',
+            )
             model_rt_merged = round(time.time() - cv_start, 2)
 
             best_alone_model = max(results_alone, key=lambda m: results_alone[m]['r2']['mean'])
@@ -676,14 +940,20 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
                 'use_holdout': True,
                 'results_user_features_only': results_alone,
                 'results_merged_with_existing': results_merged,
+                'hp_log_user_only': hp_log_alone,
+                'hp_log_merged': hp_log_merged,
             }
 
         cv_start = time.time()
-        results_alone = _run_cv_evaluation(user_features, consumption, full_run, 'user only')
+        results_alone, hp_log_alone = _run_cv_evaluation(
+            user_features, consumption, full_run, sample_weight=weights, name='user only',
+        )
         model_rt_alone = round(time.time() - cv_start, 2)
 
         cv_start = time.time()
-        results_merged = _run_cv_evaluation(merged_features, consumption, full_run, 'merged with existing')
+        results_merged, hp_log_merged = _run_cv_evaluation(
+            merged_features, consumption, full_run, sample_weight=weights, name='merged with existing',
+        )
         model_rt_merged = round(time.time() - cv_start, 2)
 
         best_alone_model = max(results_alone, key=lambda m: results_alone[m]['r2']['mean'])
@@ -707,6 +977,8 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
             'success': True,
             'results_user_features_only': results_alone,
             'results_merged_with_existing': results_merged,
+            'hp_log_user_only': hp_log_alone,
+            'hp_log_merged': hp_log_merged,
         }
 
     except Exception as e:
