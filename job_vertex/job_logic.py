@@ -1,11 +1,18 @@
 import datetime
 import inspect
+import io
 import os
 import smtplib
 import time
 import traceback
 import warnings
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 from zoneinfo import ZoneInfo
 
@@ -17,6 +24,7 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.impute import SimpleImputer
+from sklearn.inspection import permutation_importance as _permutation_importance
 from sklearn.linear_model import Lasso, Ridge
 from sklearn.metrics import r2_score
 from sklearn.model_selection import GridSearchCV, KFold, ParameterGrid, RandomizedSearchCV
@@ -443,6 +451,113 @@ def _format_hp_log(label, rf_params_per_fold, lgbm_params_per_fold):
 
 
 # ---------------------------------------------------------------------------
+# Feature importance
+# ---------------------------------------------------------------------------
+
+def _compute_feature_importance(merged_features, consumption, cider_feature_cols, best_model_name):
+    """
+    Retrain best model type on full merged data, compute permutation lift and
+    model importance for user-contributed (non-CIDER) features.
+
+    Returns (importance_df, fig) where importance_df has columns
+    [feature, lift, importance], sorted by lift descending.
+    Returns (None, None) if no custom features exist or on failure.
+    """
+    synthetic_cols = set(cider_feature_cols)
+
+    data = merged_features.join(consumption, how='inner').dropna(subset=[consumption.name])
+    feature_cols = [c for c in data.columns if c != consumption.name]
+    non_synthetic_cols = [c for c in feature_cols if c not in synthetic_cols]
+
+    if not non_synthetic_cols:
+        return None, None
+
+    X_full = data[feature_cols].values
+    y_full = data[consumption.name].values
+
+    X_processed = SimpleImputer().fit_transform(X_full)
+    X_scaled = StandardScaler().fit_transform(X_processed)
+    X_scaled = np.nan_to_num(X_scaled)
+
+    model_lower = best_model_name.lower()
+    importance_dict = {}
+
+    if 'lasso' in model_lower:
+        model = Lasso(alpha=0.01, random_state=RANDOM_SEED, max_iter=10000)
+        model.fit(X_scaled, y_full)
+        for i, col in enumerate(feature_cols):
+            importance_dict[col] = abs(model.coef_[i])
+    elif 'ridge' in model_lower:
+        model = Ridge(random_state=RANDOM_SEED, max_iter=10000)
+        model.fit(X_scaled, y_full)
+        for i, col in enumerate(feature_cols):
+            importance_dict[col] = abs(model.coef_[i])
+    elif 'forest' in model_lower or 'rf' in model_lower:
+        model = RandomForestRegressor(n_estimators=100, random_state=RANDOM_SEED, n_jobs=-1)
+        model.fit(X_scaled, y_full)
+        for i, col in enumerate(feature_cols):
+            importance_dict[col] = model.feature_importances_[i]
+    elif 'lgbm' in model_lower or 'lightgbm' in model_lower:
+        model = lgb.LGBMRegressor(n_estimators=100, random_state=RANDOM_SEED, verbose=-1)
+        model.fit(X_scaled, y_full)
+        for i, col in enumerate(feature_cols):
+            importance_dict[col] = model.feature_importances_[i]
+    else:
+        # Neural Net — permutation importance only, no model importance
+        model = _TorchRegressorWrapper(X_scaled.shape[1])
+        model.fit(X_scaled, y_full)
+        for col in feature_cols:
+            importance_dict[col] = np.nan
+
+    def _score(est, X, y):
+        return r2_score(y, est.predict(X))
+
+    perm = _permutation_importance(
+        model, X_scaled, y_full, n_repeats=10, random_state=RANDOM_SEED, scoring=_score
+    )
+    lift_dict = {feature_cols[i]: perm.importances_mean[i] for i in range(len(feature_cols))}
+
+    table_data = [
+        {
+            'feature': col,
+            'lift': lift_dict.get(col, np.nan),
+            'importance': importance_dict.get(col, np.nan),
+        }
+        for col in non_synthetic_cols
+    ]
+    importance_df = pd.DataFrame(table_data).sort_values('lift', ascending=False)
+    importance_df['importance'] = importance_df['importance'].astype(float)
+    importance_df['lift'] = importance_df['lift'].astype(float)
+
+    is_nn = 'neural' in model_lower or 'net' in model_lower
+    has_importance = not is_nn and importance_df['importance'].notna().any()
+    n_plots = 2 if has_importance else 1
+    n_feat = len(non_synthetic_cols)
+
+    fig, axes = plt.subplots(1, n_plots, figsize=(6 * n_plots, max(4, n_feat * 0.4)))
+    axes = np.atleast_1d(axes)
+    y_pos = np.arange(n_feat)
+
+    axes[0].barh(y_pos, importance_df['lift'], align='center', alpha=0.8, color='steelblue')
+    axes[0].set_yticks(y_pos)
+    axes[0].set_yticklabels(importance_df['feature'])
+    axes[0].set_xlabel('Lift (R² decrease when shuffled)')
+    axes[0].set_title('Lift (permutation importance)')
+
+    if has_importance:
+        axes[1].barh(y_pos, importance_df['importance'], align='center', alpha=0.8, color='coral')
+        axes[1].set_yticks(y_pos)
+        axes[1].set_yticklabels(importance_df['feature'])
+        axes[1].set_xlabel('Feature importance')
+        axes[1].set_title(f'Model importance ({best_model_name})')
+
+    fig.suptitle(f'Non-synthetic features — best model: {best_model_name}', y=1.02)
+    plt.tight_layout()
+
+    return importance_df, fig
+
+
+# ---------------------------------------------------------------------------
 # Email
 # ---------------------------------------------------------------------------
 
@@ -484,6 +599,18 @@ def _format_email(result):
     lines.append('=== Merged with Existing Features ===')
     lines.extend(fmt_model_results(result.get('results_merged_with_existing', {})))
 
+    importance_df = result.get('importance_df')
+    if importance_df is not None and not importance_df.empty:
+        lines.append('')
+        lines.append('=== Feature Importance (Your Custom Features) ===')
+        best_merged = result.get('best_merged_model', 'best model')
+        lines.append(f'Showing lift and model importance for non-CIDER features (model: {best_merged}).')
+        lines.append('Lift = drop in R² when that feature is randomly shuffled (higher = more important).')
+        lines.append('')
+        lines.append(importance_df.to_string(index=False, float_format=lambda x: f'{x:.4f}'))
+        lines.append('')
+        lines.append('(Figure attached as feature_importance.png)')
+
     hp_alone = result.get('hp_log_user_only', '')
     hp_merged = result.get('hp_log_merged', '')
     if hp_alone or hp_merged:
@@ -497,14 +624,28 @@ def _format_email(result):
     return subject, '\n'.join(lines)
 
 
-def _send_email(to_address, result):
+def _send_email(to_address, result, importance_fig=None):
     """Send run results via Gmail SMTP. Silently logs on any failure."""
     password = os.environ.get('GMAIL_APP_PASSWORD', 'iaoq hrkt zamw glhy')
     if not password:
         print('GMAIL_APP_PASSWORD not set, skipping email')
         return
     subject, body = _format_email(result)
-    msg = MIMEText(body)
+
+    if importance_fig is not None:
+        msg = MIMEMultipart('mixed')
+        msg.attach(MIMEText(body))
+        buf = io.BytesIO()
+        importance_fig.savefig(buf, format='png', bbox_inches='tight')
+        plt.close(importance_fig)
+        buf.seek(0)
+        img = MIMEImage(buf.read(), name='feature_importance.png')
+        img.add_header('Content-Disposition', 'attachment', filename='feature_importance.png')
+        msg.attach(img)
+    else:
+        msg = MIMEMultipart('mixed')
+        msg.attach(MIMEText(body))
+
     msg['Subject'] = subject
     msg['From'] = GMAIL_FROM
     msg['To'] = to_address
@@ -827,7 +968,8 @@ def run_job(user_code, user, data_dir, full_run, use_holdout=False):
         return error
 
     result = evaluate_featurizer(FeaturizerClass, data_dir, user=user, full_run=full_run, use_holdout=use_holdout)
-    _send_email(user, result)
+    importance_fig = result.pop('_importance_fig', None)
+    _send_email(user, result, importance_fig=importance_fig)
     return result
 
 
@@ -935,6 +1077,14 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
                           holdout_r2=results_merged[best_merged_model]['r2']['mean'],
                           holdout_spearman=results_merged[best_merged_model]['spearman']['mean'])
 
+            importance_df, importance_fig = None, None
+            try:
+                importance_df, importance_fig = _compute_feature_importance(
+                    merged_features, consumption, cider_features.columns, best_merged_model
+                )
+            except Exception as imp_e:
+                print(f'Feature importance computation failed: {imp_e}')
+
             return {
                 'success': True,
                 'use_holdout': True,
@@ -942,6 +1092,9 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
                 'results_merged_with_existing': results_merged,
                 'hp_log_user_only': hp_log_alone,
                 'hp_log_merged': hp_log_merged,
+                'importance_df': importance_df,
+                'best_merged_model': best_merged_model,
+                '_importance_fig': importance_fig,
             }
 
         cv_start = time.time()
@@ -973,12 +1126,23 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
         _update_leaderboard(LEADERBOARD_MERGED_TAB, name, user, timestamp,
                             results_merged[best_merged_model]['r2']['mean'], best_merged_model)
 
+        importance_df, importance_fig = None, None
+        try:
+            importance_df, importance_fig = _compute_feature_importance(
+                merged_features, consumption, cider_features.columns, best_merged_model
+            )
+        except Exception as imp_e:
+            print(f'Feature importance computation failed: {imp_e}')
+
         return {
             'success': True,
             'results_user_features_only': results_alone,
             'results_merged_with_existing': results_merged,
             'hp_log_user_only': hp_log_alone,
             'hp_log_merged': hp_log_merged,
+            'importance_df': importance_df,
+            'best_merged_model': best_merged_model,
+            '_importance_fig': importance_fig,
         }
 
     except Exception as e:
