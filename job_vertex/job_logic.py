@@ -454,15 +454,18 @@ def _format_hp_log(label, rf_params_per_fold, lgbm_params_per_fold):
 # Feature importance
 # ---------------------------------------------------------------------------
 
-def _compute_feature_importance(merged_features, consumption, cider_feature_cols, best_model_name):
+def _compute_feature_importance(merged_features, consumption, cider_feature_cols, best_model_name, best_params=None):
     """
-    Retrain best model type on full merged data, compute permutation lift and
-    model importance for user-contributed (non-CIDER) features.
+    Retrain best model type on full merged data using CV-selected hyperparameters,
+    compute permutation lift and model importance for user-contributed (non-CIDER) features.
 
     Returns (importance_df, fig) where importance_df has columns
     [feature, lift, importance], sorted by lift descending.
     Returns (None, None) if no custom features exist or on failure.
     """
+    if best_params is None:
+        best_params = {}
+
     synthetic_cols = set(cider_feature_cols)
 
     data = merged_features.join(consumption, how='inner').dropna(subset=[consumption.name])
@@ -482,23 +485,28 @@ def _compute_feature_importance(merged_features, consumption, cider_feature_cols
     model_lower = best_model_name.lower()
     importance_dict = {}
 
+    _RF_KEYS = {'n_estimators', 'max_depth', 'min_samples_split', 'min_samples_leaf', 'max_features'}
+
     if 'lasso' in model_lower:
-        model = Lasso(alpha=0.01, random_state=RANDOM_SEED, max_iter=10000)
+        alpha = best_params.get('model__alpha', 0.01)
+        model = Lasso(alpha=alpha, random_state=RANDOM_SEED, max_iter=10000)
         model.fit(X_scaled, y_full)
         for i, col in enumerate(feature_cols):
             importance_dict[col] = abs(model.coef_[i])
     elif 'ridge' in model_lower:
-        model = Ridge(random_state=RANDOM_SEED, max_iter=10000)
+        alpha = best_params.get('model__alpha', 1.0)
+        model = Ridge(alpha=alpha, random_state=RANDOM_SEED, max_iter=10000)
         model.fit(X_scaled, y_full)
         for i, col in enumerate(feature_cols):
             importance_dict[col] = abs(model.coef_[i])
     elif 'forest' in model_lower or 'rf' in model_lower:
-        model = RandomForestRegressor(n_estimators=100, random_state=RANDOM_SEED, n_jobs=-1)
+        rf_kwargs = {k.replace('model__', ''): v for k, v in best_params.items() if k.replace('model__', '') in _RF_KEYS}
+        model = RandomForestRegressor(random_state=RANDOM_SEED, n_jobs=-1, **rf_kwargs)
         model.fit(X_scaled, y_full)
         for i, col in enumerate(feature_cols):
             importance_dict[col] = model.feature_importances_[i]
     elif 'lgbm' in model_lower or 'lightgbm' in model_lower:
-        model = lgb.LGBMRegressor(n_estimators=100, random_state=RANDOM_SEED, verbose=-1)
+        model = lgb.LGBMRegressor(n_estimators=1000, random_state=RANDOM_SEED, verbose=-1, **best_params)
         model.fit(X_scaled, y_full)
         for i, col in enumerate(feature_cols):
             importance_dict[col] = model.feature_importances_[i]
@@ -821,11 +829,11 @@ def _run_cv_evaluation(features, consumption, full_run, sample_weight=None, name
     all_results = {}
 
     print(f'starting lasso: {datetime.datetime.now(PACIFIC)}, {name}')
-    y_true, y_pred, _ = _cv_sklearn(X, y, lasso_pipeline, LASSO_PARAM_GRID, outer_kf, inner_kf, 'lasso', sample_weight=sw)
+    y_true, y_pred, lasso_params_per_fold = _cv_sklearn(X, y, lasso_pipeline, LASSO_PARAM_GRID, outer_kf, inner_kf, 'lasso', sample_weight=sw)
     all_results['Lasso'] = _bootstrap_metrics(y_true, y_pred)
 
     print(f'starting ridge: {datetime.datetime.now(PACIFIC)}, {name}')
-    y_true, y_pred, _ = _cv_sklearn(X, y, ridge_pipeline, RIDGE_PARAM_GRID, outer_kf, inner_kf, 'ridge', sample_weight=sw)
+    y_true, y_pred, ridge_params_per_fold = _cv_sklearn(X, y, ridge_pipeline, RIDGE_PARAM_GRID, outer_kf, inner_kf, 'ridge', sample_weight=sw)
     all_results['Ridge'] = _bootstrap_metrics(y_true, y_pred)
 
     rf_params_per_fold = []
@@ -846,7 +854,13 @@ def _run_cv_evaluation(features, consumption, full_run, sample_weight=None, name
 
     print(f'done {datetime.datetime.now(PACIFIC)}, {name}')
     hp_log = _format_hp_log(name or 'CV', rf_params_per_fold, lgbm_params_per_fold)
-    return all_results, hp_log
+    best_params_per_model = {
+        'Lasso':         lasso_params_per_fold[0] if lasso_params_per_fold else {},
+        'Ridge':         ridge_params_per_fold[0] if ridge_params_per_fold else {},
+        'Random Forest': rf_params_per_fold[0]    if rf_params_per_fold    else {},
+        'LightGBM':      lgbm_params_per_fold[0]  if lgbm_params_per_fold  else {},
+    }
+    return all_results, hp_log, best_params_per_model
 
 
 def _run_holdout_evaluation(features, consumption, full_run, holdout_ids, sample_weight=None, name=None):
@@ -895,11 +909,13 @@ def _run_holdout_evaluation(features, consumption, full_run, holdout_ids, sample
     fit_params = {'model__sample_weight': sw_train} if sw_train is not None else {}
     gs.fit(X_train, y_train, **fit_params)
     all_results['Lasso'] = _bootstrap_metrics(y_holdout.values, gs.best_estimator_.predict(X_holdout))
+    lasso_best_params = gs.best_params_
 
     print(f'starting holdout ridge: {datetime.datetime.now(PACIFIC)}, {name}')
     gs = GridSearchCV(ridge_pipeline, RIDGE_PARAM_GRID, cv=inner_kf, n_jobs=-1, verbose=0)
     gs.fit(X_train, y_train, **fit_params)
     all_results['Ridge'] = _bootstrap_metrics(y_holdout.values, gs.best_estimator_.predict(X_holdout))
+    ridge_best_params = gs.best_params_
 
     rf_params_per_fold = []
     lgbm_params_per_fold = []
@@ -932,7 +948,13 @@ def _run_holdout_evaluation(features, consumption, full_run, holdout_ids, sample
 
     print(f'done holdout {datetime.datetime.now(PACIFIC)}, {name}')
     hp_log = _format_hp_log(name or 'Holdout', rf_params_per_fold, lgbm_params_per_fold)
-    return all_results, hp_log
+    best_params_per_model = {
+        'Lasso':         lasso_best_params,
+        'Ridge':         ridge_best_params,
+        'Random Forest': rf_params_per_fold[0]   if rf_params_per_fold   else {},
+        'LightGBM':      lgbm_params_per_fold[0] if lgbm_params_per_fold else {},
+    }
+    return all_results, hp_log, best_params_per_model
 
 
 def _execute_code(user_code):
@@ -1050,14 +1072,14 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
 
         if use_holdout:
             cv_start = time.time()
-            results_alone, hp_log_alone = _run_holdout_evaluation(
+            results_alone, hp_log_alone, _ = _run_holdout_evaluation(
                 user_features, consumption, full_run, holdout_ids,
                 sample_weight=weights, name='user only',
             )
             model_rt_alone = round(time.time() - cv_start, 2)
 
             cv_start = time.time()
-            results_merged, hp_log_merged = _run_holdout_evaluation(
+            results_merged, hp_log_merged, best_params_merged = _run_holdout_evaluation(
                 merged_features, consumption, full_run, holdout_ids,
                 sample_weight=weights, name='merged with existing',
             )
@@ -1080,7 +1102,8 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
             importance_df, importance_fig = None, None
             try:
                 importance_df, importance_fig = _compute_feature_importance(
-                    merged_features, consumption, cider_features.columns, best_merged_model
+                    merged_features, consumption, cider_features.columns, best_merged_model,
+                    best_params=best_params_merged.get(best_merged_model, {}),
                 )
             except Exception as imp_e:
                 print(f'Feature importance computation failed: {imp_e}')
@@ -1098,13 +1121,13 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
             }
 
         cv_start = time.time()
-        results_alone, hp_log_alone = _run_cv_evaluation(
+        results_alone, hp_log_alone, _ = _run_cv_evaluation(
             user_features, consumption, full_run, sample_weight=weights, name='user only',
         )
         model_rt_alone = round(time.time() - cv_start, 2)
 
         cv_start = time.time()
-        results_merged, hp_log_merged = _run_cv_evaluation(
+        results_merged, hp_log_merged, best_params_merged = _run_cv_evaluation(
             merged_features, consumption, full_run, sample_weight=weights, name='merged with existing',
         )
         model_rt_merged = round(time.time() - cv_start, 2)
@@ -1129,7 +1152,8 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
         importance_df, importance_fig = None, None
         try:
             importance_df, importance_fig = _compute_feature_importance(
-                merged_features, consumption, cider_features.columns, best_merged_model
+                merged_features, consumption, cider_features.columns, best_merged_model,
+                best_params=best_params_merged.get(best_merged_model, {}),
             )
         except Exception as imp_e:
             print(f'Feature importance computation failed: {imp_e}')
