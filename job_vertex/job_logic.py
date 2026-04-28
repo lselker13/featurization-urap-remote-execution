@@ -88,6 +88,22 @@ TORCH_GRID = list(ParameterGrid({
 }))
 TORCH_LIGHT_PARAMS = {"lr": 1e-3, "weight_decay": 1e-4, "patience": 10}
 
+# Single-point grids used when toy_param_grids=True — one value near the middle of each range.
+TOY_RF_PARAM_GRID = {
+    "model__n_estimators": [1000],
+    "model__max_depth": [10],
+    "model__min_samples_split": [10],
+    "model__min_samples_leaf": [5],
+    "model__max_features": ["log2"],
+}
+TOY_LGBM_PARAMS = {
+    'learning_rate': 0.1,
+    'max_depth': 5,
+    'num_leaves': 30,
+    'min_child_samples': 40,
+}
+TOY_TORCH_PARAMS = [{"lr": 5e-4, "weight_decay": 1e-4, "patience": 50}]
+
 LOAD_EXISTING_FEATURES = True
 NN_LIGHT_MODE = False  # True: skip inner CV for NN (~6x faster); False: full nested CV
 
@@ -333,8 +349,11 @@ def _lgbm_make_objective(X_outer_train, y_outer_train, inner_kf, sample_weight=N
     return objective
 
 
-def _cv_lgbm(X, y, outer_kf, inner_kf, n_trials=LGBM_N_TRIALS, sample_weight=None):
-    """Nested CV for LightGBM with Optuna inner tuning; returns (y_true, y_pred, params_per_fold)."""
+def _cv_lgbm(X, y, outer_kf, inner_kf, n_trials=LGBM_N_TRIALS, sample_weight=None, fixed_params=None):
+    """Nested CV for LightGBM with Optuna inner tuning; returns (y_true, y_pred, params_per_fold).
+
+    If fixed_params is provided, skips Optuna and uses those params in every fold.
+    """
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     X_arr = X.values if hasattr(X, 'values') else np.asarray(X)
     y_arr = y if isinstance(y, np.ndarray) else np.asarray(y)
@@ -348,12 +367,15 @@ def _cv_lgbm(X, y, outer_kf, inner_kf, n_trials=LGBM_N_TRIALS, sample_weight=Non
         # Drop columns that are entirely NaN in the training split
         keep = np.where(~np.all(np.isnan(X_outer_train), axis=0))[0]
         X_outer_train, X_outer_test = X_outer_train[:, keep], X_outer_test[:, keep]
-        study = optuna.create_study(
-            direction='maximize',
-            sampler=optuna.samplers.TPESampler(seed=RANDOM_SEED),
-        )
-        study.optimize(_lgbm_make_objective(X_outer_train, y_outer_train, inner_kf, sw_outer_train), n_trials=n_trials)
-        best = study.best_params
+        if fixed_params is not None:
+            best = fixed_params
+        else:
+            study = optuna.create_study(
+                direction='maximize',
+                sampler=optuna.samplers.TPESampler(seed=RANDOM_SEED),
+            )
+            study.optimize(_lgbm_make_objective(X_outer_train, y_outer_train, inner_kf, sw_outer_train), n_trials=n_trials)
+            best = study.best_params
         params_per_fold.append(best)
         final_model = lgb.LGBMRegressor(n_estimators=1000, random_state=RANDOM_SEED, verbose=-1, **best)
         final_model.fit(X_outer_train, y_outer_train, sample_weight=sw_outer_train)
@@ -363,8 +385,11 @@ def _cv_lgbm(X, y, outer_kf, inner_kf, n_trials=LGBM_N_TRIALS, sample_weight=Non
     return y_true, y_pred, params_per_fold
 
 
-def _lgbm_holdout(X_train, y_train, X_holdout, y_holdout, inner_kf, n_trials=LGBM_N_TRIALS, sample_weight=None):
-    """Optuna-tuned LightGBM trained on non-holdout, evaluated on holdout. Returns (y_ho, preds, best_params)."""
+def _lgbm_holdout(X_train, y_train, X_holdout, y_holdout, inner_kf, n_trials=LGBM_N_TRIALS, sample_weight=None, fixed_params=None):
+    """Optuna-tuned LightGBM trained on non-holdout, evaluated on holdout. Returns (y_ho, preds, best_params).
+
+    If fixed_params is provided, skips Optuna and uses those params directly.
+    """
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     X_tr = X_train.values if hasattr(X_train, 'values') else np.asarray(X_train)
     y_tr = y_train.values if hasattr(y_train, 'values') else np.asarray(y_train)
@@ -372,12 +397,15 @@ def _lgbm_holdout(X_train, y_train, X_holdout, y_holdout, inner_kf, n_trials=LGB
     y_ho = y_holdout.values if hasattr(y_holdout, 'values') else np.asarray(y_holdout)
     keep = np.where(~np.all(np.isnan(X_tr), axis=0))[0]
     X_tr, X_ho = X_tr[:, keep], X_ho[:, keep]
-    study = optuna.create_study(
-        direction='maximize',
-        sampler=optuna.samplers.TPESampler(seed=RANDOM_SEED),
-    )
-    study.optimize(_lgbm_make_objective(X_tr, y_tr, inner_kf, sample_weight), n_trials=n_trials)
-    best = study.best_params
+    if fixed_params is not None:
+        best = fixed_params
+    else:
+        study = optuna.create_study(
+            direction='maximize',
+            sampler=optuna.samplers.TPESampler(seed=RANDOM_SEED),
+        )
+        study.optimize(_lgbm_make_objective(X_tr, y_tr, inner_kf, sample_weight), n_trials=n_trials)
+        best = study.best_params
     final_model = lgb.LGBMRegressor(n_estimators=1000, random_state=RANDOM_SEED, verbose=-1, **best)
     final_model.fit(X_tr, y_tr, sample_weight=sample_weight)
     return y_ho, final_model.predict(X_ho), best
@@ -788,13 +816,14 @@ def load_data(data_dir):
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def _run_cv_evaluation(features, consumption, full_run, sample_weight=None, name=None):
+def _run_cv_evaluation(features, consumption, full_run, sample_weight=None, name=None, toy_param_grids=False):
     """
     Run nested CV with Lasso, RF, and NN. Returns bootstrapped metrics per model.
 
-    features:      pd.DataFrame indexed by phone_number
-    consumption:   pd.Series of log_consumption indexed by phone_number
-    sample_weight: pd.Series of survey weights indexed by phone_number (optional)
+    features:        pd.DataFrame indexed by phone_number
+    consumption:     pd.Series of log_consumption indexed by phone_number
+    sample_weight:   pd.Series of survey weights indexed by phone_number (optional)
+    toy_param_grids: if True, use single-point grids for RF, LGBM, and NN (much faster)
     """
 
     if name is None:
@@ -846,15 +875,20 @@ def _run_cv_evaluation(features, consumption, full_run, sample_weight=None, name
 
     if full_run:
         print(f'{_pt()} starting rf: {name}')
-        y_true, y_pred, rf_params_per_fold = _cv_sklearn(X, y, rf_pipeline, RF_PARAM_GRID, outer_kf, inner_kf, 'random forest', sample_weight=sw, n_iter=RF_N_ITER)
+        if toy_param_grids:
+            y_true, y_pred, rf_params_per_fold = _cv_sklearn(X, y, rf_pipeline, TOY_RF_PARAM_GRID, outer_kf, inner_kf, 'random forest', sample_weight=sw)
+        else:
+            y_true, y_pred, rf_params_per_fold = _cv_sklearn(X, y, rf_pipeline, RF_PARAM_GRID, outer_kf, inner_kf, 'random forest', sample_weight=sw, n_iter=RF_N_ITER)
         all_results['Random Forest'] = _bootstrap_metrics(y_true, y_pred)
 
         print(f'{_pt()} starting NN: {name}')
-        y_true, y_pred = _cv_torch(X, y.values, TORCH_GRID, outer_kf, inner_kf, light=NN_LIGHT_MODE, sample_weight=sw)
+        torch_grid = TOY_TORCH_PARAMS if toy_param_grids else TORCH_GRID
+        y_true, y_pred = _cv_torch(X, y.values, torch_grid, outer_kf, inner_kf, light=NN_LIGHT_MODE, sample_weight=sw)
         all_results['Neural Net'] = _bootstrap_metrics(y_true, y_pred)
 
         print(f'{_pt()} starting lgbm: {name}')
-        y_true, y_pred, lgbm_params_per_fold = _cv_lgbm(X, y.values, outer_kf, inner_kf, sample_weight=sw)
+        lgbm_fixed = TOY_LGBM_PARAMS if toy_param_grids else None
+        y_true, y_pred, lgbm_params_per_fold = _cv_lgbm(X, y.values, outer_kf, inner_kf, sample_weight=sw, fixed_params=lgbm_fixed)
         all_results['LightGBM'] = _bootstrap_metrics(y_true, y_pred)
 
     print(f'{_pt()} done: {name}')
@@ -868,7 +902,7 @@ def _run_cv_evaluation(features, consumption, full_run, sample_weight=None, name
     return all_results, hp_log, best_params_per_model
 
 
-def _run_holdout_evaluation(features, consumption, full_run, holdout_ids, sample_weight=None, name=None):
+def _run_holdout_evaluation(features, consumption, full_run, holdout_ids, sample_weight=None, name=None, toy_param_grids=False):
     """
     Tune hyperparameters via inner CV on non-holdout subscribers, train on all
     non-holdout, evaluate on holdout. Returns bootstrapped metrics per model.
@@ -927,8 +961,11 @@ def _run_holdout_evaluation(features, consumption, full_run, holdout_ids, sample
 
     if full_run:
         print(f'{_pt()} starting holdout rf: {name}')
-        gs = RandomizedSearchCV(rf_pipeline, RF_PARAM_GRID, n_iter=RF_N_ITER, cv=inner_kf,
-                                n_jobs=-1, verbose=0, random_state=RANDOM_SEED)
+        if toy_param_grids:
+            gs = GridSearchCV(rf_pipeline, TOY_RF_PARAM_GRID, cv=inner_kf, n_jobs=-1, verbose=0)
+        else:
+            gs = RandomizedSearchCV(rf_pipeline, RF_PARAM_GRID, n_iter=RF_N_ITER, cv=inner_kf,
+                                    n_jobs=-1, verbose=0, random_state=RANDOM_SEED)
         gs.fit(X_train, y_train, **fit_params)
         all_results['Random Forest'] = _bootstrap_metrics(y_holdout.values, gs.best_estimator_.predict(X_holdout))
         rf_params_per_fold = [gs.best_params_]
@@ -938,8 +975,8 @@ def _run_holdout_evaluation(features, consumption, full_run, holdout_ids, sample
         X_train_s = np.nan_to_num(scaler.transform(X_train.values))
         X_holdout_s = np.nan_to_num(scaler.transform(X_holdout.values))
         y_train_arr = y_train.values
-        if NN_LIGHT_MODE:
-            best_params = TORCH_LIGHT_PARAMS
+        if NN_LIGHT_MODE or toy_param_grids:
+            best_params = TOY_TORCH_PARAMS[0] if toy_param_grids else TORCH_LIGHT_PARAMS
         else:
             best_params = _torch_inner_cv(X_train_s, y_train_arr, TORCH_GRID, inner_kf, sample_weight=sw_train)
         model = _TorchRegressorWrapper(X_train_s.shape[1], **best_params)
@@ -947,7 +984,8 @@ def _run_holdout_evaluation(features, consumption, full_run, holdout_ids, sample
         all_results['Neural Net'] = _bootstrap_metrics(y_holdout.values, model.predict(X_holdout_s))
 
         print(f'{_pt()} starting holdout lgbm: {name}')
-        y_ho, lgbm_preds, lgbm_best = _lgbm_holdout(X_train, y_train, X_holdout, y_holdout, inner_kf, sample_weight=sw_train)
+        lgbm_fixed = TOY_LGBM_PARAMS if toy_param_grids else None
+        y_ho, lgbm_preds, lgbm_best = _lgbm_holdout(X_train, y_train, X_holdout, y_holdout, inner_kf, sample_weight=sw_train, fixed_params=lgbm_fixed)
         all_results['LightGBM'] = _bootstrap_metrics(y_ho, lgbm_preds)
         lgbm_params_per_fold = [lgbm_best]
 
@@ -979,7 +1017,7 @@ def _execute_code(user_code):
         }
 
 
-def run_job(user_code, user, data_dir, full_run, use_holdout=False):
+def run_job(user_code, user, data_dir, full_run, use_holdout=False, toy_param_grids=False):
     """
     Run the full evaluation pipeline for a submitted featurizer.
 
@@ -994,13 +1032,13 @@ def run_job(user_code, user, data_dir, full_run, use_holdout=False):
         _send_email(user, error)
         return error
 
-    result = evaluate_featurizer(FeaturizerClass, data_dir, user=user, full_run=full_run, use_holdout=use_holdout)
+    result = evaluate_featurizer(FeaturizerClass, data_dir, user=user, full_run=full_run, use_holdout=use_holdout, toy_param_grids=toy_param_grids)
     importance_fig = result.pop('_importance_fig', None)
     _send_email(user, result, importance_fig=importance_fig)
     return result
 
 
-def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=False):
+def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=False, toy_param_grids=False):
     """
     Load data from data_dir, instantiate FeaturizerClass, run featurize(),
     validate the output, and evaluate features against consumption.
@@ -1081,14 +1119,14 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
             cv_start = time.time()
             results_alone, hp_log_alone, _ = _run_holdout_evaluation(
                 user_features, consumption, full_run, holdout_ids,
-                sample_weight=weights, name='user only',
+                sample_weight=weights, name='user only', toy_param_grids=toy_param_grids,
             )
             model_rt_alone = round(time.time() - cv_start, 2)
 
             cv_start = time.time()
             results_merged, hp_log_merged, best_params_merged = _run_holdout_evaluation(
                 merged_features, consumption, full_run, holdout_ids,
-                sample_weight=weights, name='merged with existing',
+                sample_weight=weights, name='merged with existing', toy_param_grids=toy_param_grids,
             )
             model_rt_merged = round(time.time() - cv_start, 2)
 
@@ -1129,13 +1167,13 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
 
         cv_start = time.time()
         results_alone, hp_log_alone, _ = _run_cv_evaluation(
-            user_features, consumption, full_run, sample_weight=weights, name='user only',
+            user_features, consumption, full_run, sample_weight=weights, name='user only', toy_param_grids=toy_param_grids,
         )
         model_rt_alone = round(time.time() - cv_start, 2)
 
         cv_start = time.time()
         results_merged, hp_log_merged, best_params_merged = _run_cv_evaluation(
-            merged_features, consumption, full_run, sample_weight=weights, name='merged with existing',
+            merged_features, consumption, full_run, sample_weight=weights, name='merged with existing', toy_param_grids=toy_param_grids,
         )
         model_rt_merged = round(time.time() - cv_start, 2)
 

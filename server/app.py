@@ -84,7 +84,7 @@ def _reset_full_run_count(safe_user, year, week):
 # Submission logging
 # ---------------------------------------------------------------------------
 
-def log_submission(user_code, user, log_dir, full_run, use_holdout=False):
+def log_submission(user_code, user, log_dir, full_run, use_holdout=False, toy_param_grids=False):
     """Write a human-readable log to submission_logs/ and a JSON run spec to workspace/run_specs/. Returns the spec path."""
     print('logging user code')
     os.makedirs(log_dir, exist_ok=True)
@@ -111,7 +111,7 @@ def log_submission(user_code, user, log_dir, full_run, use_holdout=False):
     # JSON run spec for the job to read
     spec_path = os.path.join(SPEC_DIR, f"{base}.json")
     with open(spec_path, 'w') as f:
-        json.dump({'user': user, 'code': user_code, 'full_run': full_run, 'use_holdout': use_holdout}, f)
+        json.dump({'user': user, 'code': user_code, 'full_run': full_run, 'use_holdout': use_holdout, 'toy_param_grids': toy_param_grids}, f)
 
     return spec_path
 
@@ -202,7 +202,7 @@ def _trigger_vertex_job(json_file_path):
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def run_submission(user_code, user, log_dir, full_run, use_holdout=False):
+def run_submission(user_code, user, log_dir, full_run, use_holdout=False, toy_param_grids=False):
     """
     Top-level entry point called from app.py.
     Logs submission, validates code synchronously, triggers the job,
@@ -257,7 +257,7 @@ def run_submission(user_code, user, log_dir, full_run, use_holdout=False):
                 ),
             }, 429
     print('logging submission')
-    json_file_path = log_submission(user_code, user, log_dir, full_run, use_holdout)
+    json_file_path = log_submission(user_code, user, log_dir, full_run, use_holdout, toy_param_grids)
     print('logged submission')
     _trigger_vertex_job(json_file_path)
     print('triggered job')
@@ -284,13 +284,14 @@ def execute():
         return {'success': False, 'error': 'No code provided. Send JSON with "code" field.'}, 400
     if not data.get('user'):
         return {'success': False, 'error': 'No user provided. Send JSON with "user" field.'}, 400
-    print(f"Received submission: user={data.get('user')} full_run={data.get('full_run')} code_len={len(data.get('code', ''))}")
+    print(f"Received submission: user={data.get('user')} full_run={data.get('full_run')} toy_param_grids={data.get('toy_param_grids')} code_len={len(data.get('code', ''))}")
     return run_submission(
         data['code'],
         data['user'],
         LOG_DIR,
         data.get('full_run', False),
         data.get('use_holdout', False),
+        data.get('toy_param_grids', False),
     )
 
 @app.route('/get_counters', methods=['GET'])

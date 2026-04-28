@@ -14,8 +14,7 @@ class Featurizer:
         antennas=None,
         shapefiles=None
     ):
-        print(cdr.columns)
-        1/0
+
         outgoing = cdr.copy()
         outgoing.rename(
             columns={
