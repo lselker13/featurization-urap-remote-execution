@@ -1145,13 +1145,10 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
                           holdout_spearman=results_merged[best_merged_model]['spearman']['mean'])
 
             importance_df, importance_fig = None, None
-            try:
-                importance_df, importance_fig = _compute_feature_importance(
-                    merged_features, consumption, cider_features.columns, best_merged_model,
-                    best_params=best_params_merged.get(best_merged_model, {}),
-                )
-            except Exception as imp_e:
-                print(f'Feature importance computation failed: {imp_e}')
+            importance_df, importance_fig = _compute_feature_importance(
+                merged_features, consumption, cider_features.columns, best_merged_model,
+                best_params=best_params_merged.get(best_merged_model, {}),
+            )
 
             return {
                 'success': True,
@@ -1195,13 +1192,10 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
                             results_merged[best_merged_model]['r2']['mean'], best_merged_model)
 
         importance_df, importance_fig = None, None
-        try:
-            importance_df, importance_fig = _compute_feature_importance(
-                merged_features, consumption, cider_features.columns, best_merged_model,
-                best_params=best_params_merged.get(best_merged_model, {}),
-            )
-        except Exception as imp_e:
-            print(f'Feature importance computation failed: {imp_e}')
+        importance_df, importance_fig = _compute_feature_importance(
+            merged_features, consumption, cider_features.columns, best_merged_model,
+            best_params=best_params_merged.get(best_merged_model, {}),
+        )
 
         return {
             'success': True,
