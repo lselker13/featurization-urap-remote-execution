@@ -36,6 +36,9 @@ from googleapiclient.discovery import build
 
 PACIFIC = ZoneInfo('America/Los_Angeles')
 
+def _pt():
+    return datetime.datetime.now(PACIFIC).strftime('%H:%M:%S PT')
+
 class DropAllNaNColumns(BaseEstimator, TransformerMixin):
     def fit(self, X, y=None):
         self.cols_to_keep_ = X.columns[X.notna().any(axis=0)].tolist()
@@ -54,20 +57,20 @@ LASSO_PARAM_GRID = {"model__alpha": list(np.logspace(-4, 1, 7))}
 RIDGE_PARAM_GRID = {"model__alpha": list(np.logspace(-4, 1, 7))}
 
 RF_PARAM_GRID = {
-    "model__n_estimators": [50, 100, 200, 500, 1000],
-    "model__max_depth": [2, 3, 5, 10, 20],
-    "model__min_samples_split": [2, 5, 10],
-    "model__min_samples_leaf": [1, 2, 5],
+    "model__n_estimators": [200, 500, 1000, 2000, 4000],
+    "model__max_depth": [3, 5, 10, 20, 40],
+    "model__min_samples_split": [ 5, 10, 20,40],
+    "model__min_samples_leaf": [1, 2, 5, 10],
     "model__max_features": ["sqrt", "log2", 0.5],
 }
-RF_N_ITER = 40  # RandomizedSearchCV samples (vs 375 exhaustive combinations)
+RF_N_ITER = 40  # RandomizedSearchCV samples
 
 LGBM_N_TRIALS = 100  # Optuna trials per outer fold, matching the notebook
 LGBM_SEARCH_BOUNDS = {
     'learning_rate':     (0.01, 0.5),
     'max_depth':         (1, 10),
     'num_leaves':        (5, 60),
-    'min_child_samples': (10, 500),
+    'min_child_samples': (5, 300),
 }
 
 TORCH_GRID = list(ParameterGrid({
@@ -228,7 +231,7 @@ def _cv_sklearn(X, y, pipeline, param_grid, outer_kf, inner_kf, model_type_name=
     fold_preds = []
     params_per_fold = []
     for i, (train_idx, test_idx) in enumerate(outer_kf.split(X)):
-        print(f'running grid search fold {i} for model type {model_type_name}')
+        print(f'{_pt()} running grid search fold {i} for model type {model_type_name}')
         if n_iter is not None:
             gs = RandomizedSearchCV(pipeline, param_grid, n_iter=n_iter, cv=inner_kf,
                                     n_jobs=-1, verbose=0, random_state=RANDOM_SEED)
@@ -268,7 +271,8 @@ def _cv_torch(X, y, param_grid, outer_kf, inner_kf, light=False, sample_weight=N
     X_arr = X.values if hasattr(X, 'values') else X
     y_arr = y if isinstance(y, np.ndarray) else np.asarray(y)
     fold_preds = []
-    for train_idx, test_idx in outer_kf.split(X_arr):
+    for i, (train_idx, test_idx) in enumerate(outer_kf.split(X_arr)):
+        print(f'{_pt()} running NN fold {i}')
         X_train, X_test = X_arr[train_idx], X_arr[test_idx]
         y_train, y_test = y_arr[train_idx], y_arr[test_idx]
         sw_train = sample_weight[train_idx] if sample_weight is not None else None
@@ -329,7 +333,7 @@ def _cv_lgbm(X, y, outer_kf, inner_kf, n_trials=LGBM_N_TRIALS, sample_weight=Non
     fold_preds = []
     params_per_fold = []
     for outer_fold, (train_idx, test_idx) in enumerate(outer_kf.split(X_arr)):
-        print(f'  lgbm outer fold {outer_fold}')
+        print(f'{_pt()} lgbm outer fold {outer_fold}')
         X_outer_train, X_outer_test = X_arr[train_idx], X_arr[test_idx]
         y_outer_train, y_outer_test = y_arr[train_idx], y_arr[test_idx]
         sw_outer_train = sample_weight[train_idx] if sample_weight is not None else None
@@ -501,7 +505,7 @@ def _send_email(to_address, result):
     """Send run results via Gmail SMTP. Silently logs on any failure."""
     password = os.environ.get('GMAIL_APP_PASSWORD', 'iaoq hrkt zamw glhy')
     if not password:
-        print('GMAIL_APP_PASSWORD not set, skipping email')
+        print(f'{_pt()} GMAIL_APP_PASSWORD not set, skipping email')
         return
     subject, body = _format_email(result)
     msg = MIMEText(body)
@@ -514,9 +518,9 @@ def _send_email(to_address, result):
             smtp.starttls()
             smtp.login(GMAIL_FROM, password)
             smtp.sendmail(GMAIL_FROM, [to_address], msg.as_string())
-        print(f'Email sent to {to_address}')
+        print(f'{_pt()} Email sent to {to_address}')
     except Exception as e:
-        print(f'Failed to send email to {to_address}: {e}')
+        print(f'{_pt()} Failed to send email to {to_address}: {e}')
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +529,7 @@ def _send_email(to_address, result):
 
 def _log_to_sheet(name, user, timestamp, r2, spearman, feat_rt, model_rt, result_type, model_type, holdout_r2=None, holdout_spearman=None):
     """Append one row to the Google Sheet. Silently logs and returns on any failure."""
-    print('logging to sheet')
+    print(f'{_pt()} logging to sheet')
     creds, _ = google.auth.default(
         scopes=['https://www.googleapis.com/auth/spreadsheets']
     )
@@ -542,7 +546,7 @@ def _log_to_sheet(name, user, timestamp, r2, spearman, feat_rt, model_rt, result
 
 def _update_leaderboard(sheet_tab, name, user, timestamp, r2, model_type):
     """Update a leaderboard sheet if this run belongs in the top LEADERBOARD_SIZE by R2."""
-    print('logging to leaderboard')
+    print(f'{_pt()} logging to leaderboard')
     creds, _ = google.auth.default(
         scopes=['https://www.googleapis.com/auth/spreadsheets']
     )
@@ -679,11 +683,11 @@ def _run_cv_evaluation(features, consumption, full_run, sample_weight=None, name
 
     all_results = {}
 
-    print(f'starting lasso: {datetime.datetime.now(PACIFIC)}, {name}')
+    print(f'{_pt()} starting lasso: {name}')
     y_true, y_pred, _ = _cv_sklearn(X, y, lasso_pipeline, LASSO_PARAM_GRID, outer_kf, inner_kf, 'lasso', sample_weight=sw)
     all_results['Lasso'] = _bootstrap_metrics(y_true, y_pred)
 
-    print(f'starting ridge: {datetime.datetime.now(PACIFIC)}, {name}')
+    print(f'{_pt()} starting ridge: {name}')
     y_true, y_pred, _ = _cv_sklearn(X, y, ridge_pipeline, RIDGE_PARAM_GRID, outer_kf, inner_kf, 'ridge', sample_weight=sw)
     all_results['Ridge'] = _bootstrap_metrics(y_true, y_pred)
 
@@ -691,19 +695,19 @@ def _run_cv_evaluation(features, consumption, full_run, sample_weight=None, name
     lgbm_params_per_fold = []
 
     if full_run:
-        print(f'starting rf: {datetime.datetime.now(PACIFIC)}, {name}')
+        print(f'{_pt()} starting rf: {name}')
         y_true, y_pred, rf_params_per_fold = _cv_sklearn(X, y, rf_pipeline, RF_PARAM_GRID, outer_kf, inner_kf, 'random forest', sample_weight=sw, n_iter=RF_N_ITER)
         all_results['Random Forest'] = _bootstrap_metrics(y_true, y_pred)
 
-        print(f'starting NN: {datetime.datetime.now(PACIFIC)}, {name}')
+        print(f'{_pt()} starting NN: {name}')
         y_true, y_pred = _cv_torch(X, y.values, TORCH_GRID, outer_kf, inner_kf, light=NN_LIGHT_MODE, sample_weight=sw)
         all_results['Neural Net'] = _bootstrap_metrics(y_true, y_pred)
 
-        print(f'starting lgbm: {datetime.datetime.now(PACIFIC)}, {name}')
+        print(f'{_pt()} starting lgbm: {name}')
         y_true, y_pred, lgbm_params_per_fold = _cv_lgbm(X, y.values, outer_kf, inner_kf, sample_weight=sw)
         all_results['LightGBM'] = _bootstrap_metrics(y_true, y_pred)
 
-    print(f'done {datetime.datetime.now(PACIFIC)}, {name}')
+    print(f'{_pt()} done: {name}')
     hp_log = _format_hp_log(name or 'CV', rf_params_per_fold, lgbm_params_per_fold)
     return all_results, hp_log
 
@@ -749,13 +753,13 @@ def _run_holdout_evaluation(features, consumption, full_run, holdout_ids, sample
     inner_kf = KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_SEED)
     all_results = {}
 
-    print(f'starting holdout lasso: {datetime.datetime.now(PACIFIC)}, {name}')
+    print(f'{_pt()} starting holdout lasso: {name}')
     gs = GridSearchCV(lasso_pipeline, LASSO_PARAM_GRID, cv=inner_kf, n_jobs=-1, verbose=0)
     fit_params = {'model__sample_weight': sw_train} if sw_train is not None else {}
     gs.fit(X_train, y_train, **fit_params)
     all_results['Lasso'] = _bootstrap_metrics(y_holdout.values, gs.best_estimator_.predict(X_holdout))
 
-    print(f'starting holdout ridge: {datetime.datetime.now(PACIFIC)}, {name}')
+    print(f'{_pt()} starting holdout ridge: {name}')
     gs = GridSearchCV(ridge_pipeline, RIDGE_PARAM_GRID, cv=inner_kf, n_jobs=-1, verbose=0)
     gs.fit(X_train, y_train, **fit_params)
     all_results['Ridge'] = _bootstrap_metrics(y_holdout.values, gs.best_estimator_.predict(X_holdout))
@@ -764,14 +768,14 @@ def _run_holdout_evaluation(features, consumption, full_run, holdout_ids, sample
     lgbm_params_per_fold = []
 
     if full_run:
-        print(f'starting holdout rf: {datetime.datetime.now(PACIFIC)}, {name}')
+        print(f'{_pt()} starting holdout rf: {name}')
         gs = RandomizedSearchCV(rf_pipeline, RF_PARAM_GRID, n_iter=RF_N_ITER, cv=inner_kf,
                                 n_jobs=-1, verbose=0, random_state=RANDOM_SEED)
         gs.fit(X_train, y_train, **fit_params)
         all_results['Random Forest'] = _bootstrap_metrics(y_holdout.values, gs.best_estimator_.predict(X_holdout))
         rf_params_per_fold = [gs.best_params_]
 
-        print(f'starting holdout NN: {datetime.datetime.now(PACIFIC)}, {name}')
+        print(f'{_pt()} starting holdout NN: {name}')
         scaler = StandardScaler().fit(X_train.values)
         X_train_s = np.nan_to_num(scaler.transform(X_train.values))
         X_holdout_s = np.nan_to_num(scaler.transform(X_holdout.values))
@@ -784,12 +788,12 @@ def _run_holdout_evaluation(features, consumption, full_run, holdout_ids, sample
         model.fit(X_train_s, y_train_arr, sample_weight=sw_train)
         all_results['Neural Net'] = _bootstrap_metrics(y_holdout.values, model.predict(X_holdout_s))
 
-        print(f'starting holdout lgbm: {datetime.datetime.now(PACIFIC)}, {name}')
+        print(f'{_pt()} starting holdout lgbm: {name}')
         y_ho, lgbm_preds, lgbm_best = _lgbm_holdout(X_train, y_train, X_holdout, y_holdout, inner_kf, sample_weight=sw_train)
         all_results['LightGBM'] = _bootstrap_metrics(y_ho, lgbm_preds)
         lgbm_params_per_fold = [lgbm_best]
 
-    print(f'done holdout {datetime.datetime.now(PACIFIC)}, {name}')
+    print(f'{_pt()} done holdout: {name}')
     hp_log = _format_hp_log(name or 'Holdout', rf_params_per_fold, lgbm_params_per_fold)
     return all_results, hp_log
 
@@ -822,7 +826,7 @@ def run_job(user_code, user, data_dir, full_run, use_holdout=False):
     """
     FeaturizerClass, error = _execute_code(user_code)
     if error is not None:
-        print(f'ERROR executing code: {error}')
+        print(f'{_pt()} ERROR executing code: {error}')
         _send_email(user, error)
         return error
 
@@ -880,20 +884,22 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
         cider_features = togo_dfs['cider_features']
 
         featurize_kwargs = dict(
-            cdr=togo_dfs['combined_real_cdr'],
-            mobile_money=togo_dfs['combined_real_mobile_money'],
-            mobile_data=togo_dfs['combined_real_mobile_data'],
+            cdr=togo_dfs['combined_real_cdr'].copy(),
+            mobile_money=togo_dfs['combined_real_mobile_money'].copy(),
+            mobile_data=togo_dfs['combined_real_mobile_data'].copy(),
             recharges=None,
-            antennas=togo_dfs['combined_real_antennas'],
-            shapefiles=togo_dfs['shapefiles'],
+            antennas=togo_dfs['combined_real_antennas'].copy(),
+            shapefiles=togo_dfs['shapefiles'].copy(),
         )
-
+        togo_dfs['cider_features']
+        if 'existing_features' in inspect.signature(featurizer.featurize).parameters:
+            featurize_kwargs['existing_features'] = togo_dfs['cider_features'].copy()
         if use_holdout:
             holdout_path = os.path.join(data_dir, 'togo_2018_oct_dec', 'real_data', 'hold_out_subscribers.csv')
             holdout_ids = set(pd.read_csv(holdout_path)['phone_number'])
             train_consumption = consumption[~consumption.index.isin(holdout_ids)]
             if 'consumption' in inspect.signature(featurizer.featurize).parameters:
-                featurize_kwargs['consumption'] = train_consumption
+                featurize_kwargs['consumption'] = train_consumption.copy()
 
         feat_start = time.time()
         user_features = featurizer.featurize(**featurize_kwargs)

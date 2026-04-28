@@ -202,7 +202,7 @@ def _trigger_vertex_job(json_file_path):
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def run_submission(user_code, user, log_dir, full_run, use_vertex=False, use_holdout=False):
+def run_submission(user_code, user, log_dir, full_run, use_holdout=False):
     """
     Top-level entry point called from app.py.
     Logs submission, validates code synchronously, triggers the job,
@@ -290,7 +290,6 @@ def execute():
         data['user'],
         LOG_DIR,
         data.get('full_run', False),
-        data.get('use_vertex', False),
         data.get('use_holdout', False),
     )
 
