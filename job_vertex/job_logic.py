@@ -501,7 +501,12 @@ def _compute_feature_importance(merged_features, consumption, cider_feature_cols
     synthetic_cols = set(cider_feature_cols)
 
     data = merged_features.join(consumption, how='inner').dropna(subset=[consumption.name])
-    feature_cols = [c for c in data.columns if c != consumption.name]
+    all_feature_cols = [c for c in data.columns if c != consumption.name]
+
+    # Match the training pipeline: drop entirely-NaN columns. Their coefficient
+    # / importance is undefined, so they're omitted from the report rather than
+    # reported as zero.
+    feature_cols = DropAllNaNColumns().fit(data[all_feature_cols]).cols_to_keep_
     non_synthetic_cols = [c for c in feature_cols if c not in synthetic_cols]
 
     if not non_synthetic_cols:
