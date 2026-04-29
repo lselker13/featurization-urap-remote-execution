@@ -769,11 +769,12 @@ def _update_leaderboard(sheet_tab, name, user, timestamp, r2, model_type):
 # ---------------------------------------------------------------------------
 
 def load_data(data_dir):
-    real_data = os.path.join(data_dir, 'togo_2018_oct_dec', 'real_data')
+    dated_data_path = os.path.join(data_dir, 'togo_2018_oct_dec')
+    dateless_data_path = os.path.join(data_dir, 'togo_dateless')
     togo_dfs = {}
 
     # Survey outcomes: phone_number, weight, consumption
-    survey = pd.read_csv(os.path.join(real_data, 'survey2018outcomes_no_duplicates.csv'))
+    survey = pd.read_csv(os.path.join(dateless_data_path, 'survey2018outcomes_no_duplicates.csv'))
     survey['log_consumption'] = np.log1p(survey['consumption'])
     survey.drop_duplicates('phone_number', keep='first', inplace=True)
     survey.index = survey['phone_number']
@@ -781,20 +782,20 @@ def load_data(data_dir):
     togo_dfs['combined_real_consumption'] = survey  # columns: weight, consumption, log_consumption
 
     # CDR (partitioned parquet directory)
-    togo_dfs['combined_real_cdr'] = pd.read_parquet(os.path.join(real_data, 'cdr'))
+    togo_dfs['combined_real_cdr'] = pd.read_parquet(os.path.join(dated_data_path, 'real_data', 'cdr'))
 
     # Mobile money (partitioned parquet directory)
-    togo_dfs['combined_real_mobile_money'] = pd.read_parquet(os.path.join(real_data, 'mobile_money'))
+    togo_dfs['combined_real_mobile_money'] = pd.read_parquet(os.path.join(dated_data_path, 'real_data', 'mobile_money'))
 
     # Mobile data (partitioned parquet directory)
-    togo_dfs['combined_real_mobile_data'] = pd.read_parquet(os.path.join(real_data, 'mobile_data'))
+    togo_dfs['combined_real_mobile_data'] = pd.read_parquet(os.path.join(dated_data_path, 'real_data', 'mobile_data'))
 
     # Antennas
-    togo_dfs['combined_real_antennas'] = pd.read_csv(os.path.join(real_data, 'antennas.csv'))
+    togo_dfs['combined_real_antennas'] = pd.read_csv(os.path.join(dateless_data_path, 'antennas.csv'))
 
     # Existing CIDER features
     if LOAD_EXISTING_FEATURES:
-        df = pd.read_parquet(os.path.join(data_dir, 'togo_2018_oct_dec', 'features'))
+        df = pd.read_parquet(os.path.join(dated_data_path, 'features'))
         df = df.rename(columns={"name": "phone_number"})
         df.index = df["phone_number"]
         df.drop(columns=["phone_number"], inplace=True)
@@ -803,7 +804,7 @@ def load_data(data_dir):
         togo_dfs['cider_features'] = pd.DataFrame(index=togo_dfs['combined_real_consumption'].index)
 
     # Shapefiles (GeoJSON)
-    geo_path = os.path.join(real_data, 'geo')
+    geo_path = os.path.join(dateless_data_path, 'geo')
     togo_dfs['shapefiles'] = {}
     for shapefile in [f for f in os.listdir(geo_path) if f.endswith('.geojson')]:
         name = os.path.splitext(shapefile)[0]
