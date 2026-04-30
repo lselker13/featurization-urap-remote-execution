@@ -12,5 +12,5 @@ gcloud config set run/region us-central1
 # Create the bucket
 gcloud storage buckets create gs://featurization-test-bucket
 
-# Transfer data
-gcloud storage cp --recursive data_for_bucket/* gs://featurization-test-bucket/data/
+# Transfer data (unneeded, it's now baked into the artifact)
+# gcloud storage cp --recursive data_for_bucket/* gs://featurization-test-bucket/data/

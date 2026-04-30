@@ -108,6 +108,7 @@ LOAD_EXISTING_FEATURES = True
 NN_LIGHT_MODE = False  # True: skip inner CV for NN (~6x faster); False: full nested CV
 
 SHEET_ID = '13vZkBNoI1TNKEuWJhtFospr_XNR23DpZTobjaKAJneA'
+FINAL_EVAL_SHEET_ID = '1a_evWLy8NxFcaD89knoc4F3mCHqfeX0AiSBmOrIEqJ0'
 SHEET_TAB = 'Results log'
 LEADERBOARD_STANDALONE_TAB = 'Leaderboard: Stand-alone'
 LEADERBOARD_MERGED_TAB = 'Leaderboard: Along with existing features'
@@ -498,7 +499,7 @@ def _compute_feature_importance(merged_features, consumption, cider_feature_cols
     if best_params is None:
         best_params = {}
 
-    synthetic_cols = set(cider_feature_cols)
+    cider_cols = set(cider_feature_cols)
 
     data = merged_features.join(consumption, how='inner').dropna(subset=[consumption.name])
     all_feature_cols = [c for c in data.columns if c != consumption.name]
@@ -507,9 +508,9 @@ def _compute_feature_importance(merged_features, consumption, cider_feature_cols
     # / importance is undefined, so they're omitted from the report rather than
     # reported as zero.
     feature_cols = DropAllNaNColumns().fit(data[all_feature_cols]).cols_to_keep_
-    non_synthetic_cols = [c for c in feature_cols if c not in synthetic_cols]
+    non_cider_cols = [c for c in feature_cols if c not in cider_cols]
 
-    if not non_synthetic_cols:
+    if not non_cider_cols:
         return None, None
 
     X_full = data[feature_cols].values
@@ -568,7 +569,7 @@ def _compute_feature_importance(merged_features, consumption, cider_feature_cols
             'lift': lift_dict.get(col, np.nan),
             'importance': importance_dict.get(col, np.nan),
         }
-        for col in non_synthetic_cols
+        for col in non_cider_cols
     ]
     importance_df = pd.DataFrame(table_data).sort_values('lift', ascending=False)
     importance_df['importance'] = importance_df['importance'].astype(float)
@@ -577,7 +578,7 @@ def _compute_feature_importance(merged_features, consumption, cider_feature_cols
     is_nn = 'neural' in model_lower or 'net' in model_lower
     has_importance = not is_nn and importance_df['importance'].notna().any()
     n_plots = 2 if has_importance else 1
-    n_feat = len(non_synthetic_cols)
+    n_feat = len(non_cider_cols)
 
     fig, axes = plt.subplots(1, n_plots, figsize=(6 * n_plots, max(4, n_feat * 0.4)))
     axes = np.atleast_1d(axes)
@@ -596,7 +597,7 @@ def _compute_feature_importance(merged_features, consumption, cider_feature_cols
         axes[1].set_xlabel('Feature importance')
         axes[1].set_title(f'Model importance ({best_model_name})')
 
-    fig.suptitle(f'Non-synthetic features — best model: {best_model_name}', y=1.02)
+    fig.suptitle(f'Features — best model: {best_model_name}', y=1.02)
     plt.tight_layout()
 
     return importance_df, fig
@@ -606,7 +607,7 @@ def _compute_feature_importance(merged_features, consumption, cider_feature_cols
 # Email
 # ---------------------------------------------------------------------------
 
-def _format_email(result):
+def _format_email(result, final_evaluation=False):
     """Return (subject, body) for a human-readable result email."""
     if not result.get('success'):
         subject = 'Featurization Run — Run Error'
@@ -619,6 +620,9 @@ def _format_email(result):
             lines.append('Traceback:')
             lines.append(result['traceback'])
         return subject, '\n'.join(lines)
+
+    if final_evaluation:
+        return 'Featurization Run — Final Evaluation Complete', 'Your final evaluation run has completed successfully.'
 
     def fmt_metric(m):
         return f"{m['mean']:.4f}  (95% CI: {m['ci_low']:.4f} – {m['ci_high']:.4f})"
@@ -647,9 +651,9 @@ def _format_email(result):
     importance_df = result.get('importance_df')
     if importance_df is not None and not importance_df.empty:
         lines.append('')
-        lines.append('=== Feature Importance (Your Custom Features) ===')
-        best_merged = result.get('best_merged_model', 'best model')
-        lines.append(f'Showing lift and model importance for non-CIDER features (model: {best_merged}).')
+        lines.append('=== Feature Importance ===')
+        best_alone = result.get('best_alone_model', 'best model')
+        lines.append(f'Showing lift and model importance for your features (model: {best_alone}).')
         lines.append('Lift = drop in R² when that feature is randomly shuffled (higher = more important).')
         lines.append('')
         lines.append(importance_df.to_string(index=False, float_format=lambda x: f'{x:.4f}'))
@@ -669,13 +673,13 @@ def _format_email(result):
     return subject, '\n'.join(lines)
 
 
-def _send_email(to_address, result, importance_fig=None):
+def _send_email(to_address, result, importance_fig=None, final_evaluation=False):
     """Send run results via Gmail SMTP. Silently logs on any failure."""
     password = os.environ.get('GMAIL_APP_PASSWORD', 'iaoq hrkt zamw glhy')
     if not password:
         print(f'{_pt()} GMAIL_APP_PASSWORD not set, skipping email')
         return
-    subject, body = _format_email(result)
+    subject, body = _format_email(result, final_evaluation=final_evaluation)
 
     if importance_fig is not None:
         msg = MIMEMultipart('mixed')
@@ -709,7 +713,7 @@ def _send_email(to_address, result, importance_fig=None):
 # Google Sheets
 # ---------------------------------------------------------------------------
 
-def _log_to_sheet(name, user, timestamp, r2, spearman, feat_rt, model_rt, result_type, model_type, holdout_r2=None, holdout_spearman=None):
+def _log_to_sheet(name, user, timestamp, r2, spearman, feat_rt, model_rt, result_type, model_type, holdout_r2=None, holdout_spearman=None, sheet_id=None):
     """Append one row to the Google Sheet. Silently logs and returns on any failure."""
     print(f'{_pt()} logging to sheet')
     creds, _ = google.auth.default(
@@ -718,7 +722,7 @@ def _log_to_sheet(name, user, timestamp, r2, spearman, feat_rt, model_rt, result
     service = build('sheets', 'v4', credentials=creds)
     row = [name, user, timestamp, r2, spearman, holdout_r2, holdout_spearman, feat_rt, model_rt, result_type, model_type]
     service.spreadsheets().values().append(
-        spreadsheetId=SHEET_ID,
+        spreadsheetId=sheet_id or SHEET_ID,
         range=f"'{SHEET_TAB}'!A:K",
         valueInputOption='USER_ENTERED',
         insertDataOption='INSERT_ROWS',
@@ -726,7 +730,7 @@ def _log_to_sheet(name, user, timestamp, r2, spearman, feat_rt, model_rt, result
     ).execute()
 
 
-def _update_leaderboard(sheet_tab, name, user, timestamp, r2, model_type):
+def _update_leaderboard(sheet_tab, name, user, timestamp, r2, model_type, sheet_id=None):
     """Update a leaderboard sheet if this run belongs in the top LEADERBOARD_SIZE by R2."""
     print(f'{_pt()} logging to leaderboard')
     creds, _ = google.auth.default(
@@ -734,9 +738,10 @@ def _update_leaderboard(sheet_tab, name, user, timestamp, r2, model_type):
     )
     service = build('sheets', 'v4', credentials=creds)
 
+    active_sheet_id = sheet_id or SHEET_ID
     range_name = f"'{sheet_tab}'!A:E"
     result = service.spreadsheets().values().get(
-        spreadsheetId=SHEET_ID,
+        spreadsheetId=active_sheet_id,
         range=range_name,
     ).execute()
 
@@ -762,7 +767,7 @@ def _update_leaderboard(sheet_tab, name, user, timestamp, r2, model_type):
         entries = entries[:LEADERBOARD_SIZE]
 
         service.spreadsheets().values().update(
-            spreadsheetId=SHEET_ID,
+            spreadsheetId=active_sheet_id,
             range=range_name,
             valueInputOption='USER_ENTERED',
             body={'values': [header] + entries},
@@ -773,8 +778,10 @@ def _update_leaderboard(sheet_tab, name, user, timestamp, r2, model_type):
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_data(data_dir):
-    dated_data_path = os.path.join(data_dir, 'togo_2018_oct_dec')
+def load_data(data_dir, final_evaluation=False):
+    dated_folder = 'togo_2019_apr_jun' if final_evaluation else 'togo_2018_oct_dec'
+    print(f'geetting dated data from {dated_folder}')
+    dated_data_path = os.path.join(data_dir, dated_folder)
     dateless_data_path = os.path.join(data_dir, 'togo_dateless')
     togo_dfs = {}
 
@@ -1023,7 +1030,7 @@ def _execute_code(user_code):
         }
 
 
-def run_job(user_code, user, data_dir, full_run, use_holdout=False, toy_param_grids=False):
+def run_job(user_code, user, data_dir, full_run, use_holdout=False, toy_param_grids=False, final_evaluation=False):
     """
     Run the full evaluation pipeline for a submitted featurizer.
 
@@ -1032,19 +1039,22 @@ def run_job(user_code, user, data_dir, full_run, use_holdout=False, toy_param_gr
 
     Returns the result dict (same shape as evaluate_featurizer).
     """
+    if final_evaluation:
+        full_run = True
+
     FeaturizerClass, error = _execute_code(user_code)
     if error is not None:
         print(f'{_pt()} ERROR executing code: {error}')
-        _send_email(user, error)
+        _send_email(user, error, final_evaluation=final_evaluation)
         return error
 
-    result = evaluate_featurizer(FeaturizerClass, data_dir, user=user, full_run=full_run, use_holdout=use_holdout, toy_param_grids=toy_param_grids)
+    result = evaluate_featurizer(FeaturizerClass, data_dir, user=user, full_run=full_run, use_holdout=use_holdout, toy_param_grids=toy_param_grids, final_evaluation=final_evaluation)
     importance_fig = result.pop('_importance_fig', None)
-    _send_email(user, result, importance_fig=importance_fig)
+    _send_email(user, result, importance_fig=importance_fig, final_evaluation=final_evaluation)
     return result
 
 
-def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=False, toy_param_grids=False):
+def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=False, toy_param_grids=False, final_evaluation=False):
     """
     Load data from data_dir, instantiate FeaturizerClass, run featurize(),
     validate the output, and evaluate features against consumption.
@@ -1070,7 +1080,8 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
         result = evaluate_featurizer(MyFeaturizer, data_dir='/local/path/to/data')
     """
     try:
-        togo_dfs = load_data(data_dir)
+        active_sheet_id = FINAL_EVAL_SHEET_ID if final_evaluation else SHEET_ID
+        togo_dfs = load_data(data_dir, final_evaluation=final_evaluation)
 
         featurizer = FeaturizerClass()
         if not hasattr(featurizer, 'featurize'):
@@ -1104,7 +1115,7 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
         if 'existing_features' in inspect.signature(featurizer.featurize).parameters:
             featurize_kwargs['existing_features'] = togo_dfs['cider_features'].copy()
         if use_holdout:
-            holdout_path = os.path.join(data_dir, 'togo_2018_oct_dec', 'real_data', 'hold_out_subscribers.csv')
+            holdout_path = os.path.join(data_dir, 'togo_dateless', 'hold_out_subscribers.csv')
             holdout_ids = set(pd.read_csv(holdout_path)['phone_number'])
             train_consumption = consumption[~consumption.index.isin(holdout_ids)]
             if 'consumption' in inspect.signature(featurizer.featurize).parameters:
@@ -1123,7 +1134,7 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
 
         if use_holdout:
             cv_start = time.time()
-            results_alone, hp_log_alone, _ = _run_holdout_evaluation(
+            results_alone, hp_log_alone, best_params_alone = _run_holdout_evaluation(
                 user_features, consumption, full_run, holdout_ids,
                 sample_weight=weights, name='user only', toy_param_grids=toy_param_grids,
             )
@@ -1143,18 +1154,21 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
                           None, None,
                           feat_rt, model_rt_alone, 'user only', best_alone_model,
                           holdout_r2=results_alone[best_alone_model]['r2']['mean'],
-                          holdout_spearman=results_alone[best_alone_model]['spearman']['mean'])
+                          holdout_spearman=results_alone[best_alone_model]['spearman']['mean'],
+                          sheet_id=active_sheet_id)
             _log_to_sheet(name, user, timestamp,
                           None, None,
                           feat_rt, model_rt_merged, 'merged with existing', best_merged_model,
                           holdout_r2=results_merged[best_merged_model]['r2']['mean'],
-                          holdout_spearman=results_merged[best_merged_model]['spearman']['mean'])
+                          holdout_spearman=results_merged[best_merged_model]['spearman']['mean'],
+                          sheet_id=active_sheet_id)
 
             importance_df, importance_fig = None, None
-            importance_df, importance_fig = _compute_feature_importance(
-                merged_features, consumption, cider_features.columns, best_merged_model,
-                best_params=best_params_merged.get(best_merged_model, {}),
-            )
+            if not final_evaluation:
+                importance_df, importance_fig = _compute_feature_importance(
+                    user_features, consumption, [], best_alone_model,
+                    best_params=best_params_alone.get(best_alone_model, {}),
+                )
 
             return {
                 'success': True,
@@ -1164,12 +1178,12 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
                 'hp_log_user_only': hp_log_alone,
                 'hp_log_merged': hp_log_merged,
                 'importance_df': importance_df,
-                'best_merged_model': best_merged_model,
+                'best_alone_model': best_alone_model,
                 '_importance_fig': importance_fig,
             }
 
         cv_start = time.time()
-        results_alone, hp_log_alone, _ = _run_cv_evaluation(
+        results_alone, hp_log_alone, best_params_alone = _run_cv_evaluation(
             user_features, consumption, full_run, sample_weight=weights, name='user only', toy_param_grids=toy_param_grids,
         )
         model_rt_alone = round(time.time() - cv_start, 2)
@@ -1186,22 +1200,27 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
         _log_to_sheet(name, user, timestamp,
                       results_alone[best_alone_model]['r2']['mean'],
                       results_alone[best_alone_model]['spearman']['mean'],
-                      feat_rt, model_rt_alone, 'user only', best_alone_model)
+                      feat_rt, model_rt_alone, 'user only', best_alone_model,
+                      sheet_id=active_sheet_id)
         _log_to_sheet(name, user, timestamp,
                       results_merged[best_merged_model]['r2']['mean'],
                       results_merged[best_merged_model]['spearman']['mean'],
-                      feat_rt, model_rt_merged, 'merged with existing', best_merged_model)
+                      feat_rt, model_rt_merged, 'merged with existing', best_merged_model,
+                      sheet_id=active_sheet_id)
 
         _update_leaderboard(LEADERBOARD_STANDALONE_TAB, name, user, timestamp,
-                            results_alone[best_alone_model]['r2']['mean'], best_alone_model)
+                            results_alone[best_alone_model]['r2']['mean'], best_alone_model,
+                            sheet_id=active_sheet_id)
         _update_leaderboard(LEADERBOARD_MERGED_TAB, name, user, timestamp,
-                            results_merged[best_merged_model]['r2']['mean'], best_merged_model)
+                            results_merged[best_merged_model]['r2']['mean'], best_merged_model,
+                            sheet_id=active_sheet_id)
 
         importance_df, importance_fig = None, None
-        importance_df, importance_fig = _compute_feature_importance(
-            merged_features, consumption, cider_features.columns, best_merged_model,
-            best_params=best_params_merged.get(best_merged_model, {}),
-        )
+        if not final_evaluation:
+            importance_df, importance_fig = _compute_feature_importance(
+                user_features, consumption, [], best_alone_model,
+                best_params=best_params_alone.get(best_alone_model, {}),
+            )
 
         return {
             'success': True,
@@ -1210,7 +1229,7 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
             'hp_log_user_only': hp_log_alone,
             'hp_log_merged': hp_log_merged,
             'importance_df': importance_df,
-            'best_merged_model': best_merged_model,
+            'best_alone_model': best_alone_model,
             '_importance_fig': importance_fig,
         }
 

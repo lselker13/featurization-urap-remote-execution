@@ -39,5 +39,6 @@ class Featurizer:
 
         bidirectional = pd.concat((outgoing, incoming))
 
-        num_transactions = bidirectional.groupby('ego').apply(len).rename('num_transactions')
-        return num_transactions.to_frame()
+        num_outgoing = outgoing.groupby('ego').apply(len).rename('num_outgoing')
+        num_incoming = incoming.groupby('ego').apply(len).rename('num_incoming')
+        return num_transactions.to_frame().join(num_incoming)

@@ -22,8 +22,21 @@ def main():
 
     with open(json_path) as f:
         payload = json.load(f)
-    print(f"Running job: user={payload['user']} full_run={payload['full_run']} use_holdout={payload.get('use_holdout', False)} toy_param_grids={payload.get('toy_param_grids', False)}")
-    result = run_job(payload['code'], payload['user'], DATA_DIR, payload['full_run'], payload.get('use_holdout', False), payload.get('toy_param_grids', False))
+    print(
+        f"Running job: user={payload['user']} full_run={payload['full_run']}"
+        f" use_holdout={payload.get('use_holdout', False)}"
+        f" toy_param_grids={payload.get('toy_param_grids', False)}"
+        f" final_evaluation={payload.get('final_evaluation', False)}"
+    )
+    result = run_job(
+        payload['code'],
+        payload['user'],
+        DATA_DIR,
+        payload['full_run'],
+        payload.get('use_holdout', False),
+        payload.get('toy_param_grids', False),
+        payload.get('final_evaluation', False),
+    )
 
     if not result.get('success'):
         sys.exit(1)

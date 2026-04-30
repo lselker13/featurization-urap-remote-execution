@@ -17,6 +17,7 @@ LOG_DIR = os.environ.get('LOG_DIR', '/data/submission_logs')
 SPEC_DIR = os.environ.get('SPEC_DIR', '/data/workspace/run_specs')
 RATE_LIMIT_BUCKET = os.environ.get('RATE_LIMIT_BUCKET', 'featurization-test-bucket')
 FULL_RUN_WEEKLY_LIMIT = 5
+FINAL_EVAL_LIMIT = 1
 
 app = Flask(__name__)
 
@@ -80,11 +81,36 @@ def _reset_full_run_count(safe_user, year, week):
     blob.upload_from_string(json.dumps(data), content_type='application/json')
 
 
+def _get_final_eval_count(safe_user):
+    """Return the total final_evaluation submission count for this user, or 0 if not found."""
+    client = _gcs_client()
+    bucket = client.bucket(RATE_LIMIT_BUCKET)
+    blob = bucket.blob(f'final_evaluation_runs/{safe_user}.json')
+    if not blob.exists():
+        return 0
+    data = json.loads(blob.download_as_text())
+    return data.get('count', 0)
+
+
+def _increment_final_eval_count(safe_user):
+    """Increment the final_evaluation counter for this user in GCS. Returns new count."""
+    client = _gcs_client()
+    bucket = client.bucket(RATE_LIMIT_BUCKET)
+    blob = bucket.blob(f'final_evaluation_runs/{safe_user}.json')
+    if blob.exists():
+        data = json.loads(blob.download_as_text())
+    else:
+        data = {'user': safe_user, 'count': 0}
+    data['count'] = data.get('count', 0) + 1
+    blob.upload_from_string(json.dumps(data), content_type='application/json')
+    return data['count']
+
+
 # ---------------------------------------------------------------------------
 # Submission logging
 # ---------------------------------------------------------------------------
 
-def log_submission(user_code, user, log_dir, full_run, use_holdout=False, toy_param_grids=False):
+def log_submission(user_code, user, log_dir, full_run, use_holdout=False, toy_param_grids=False, final_evaluation=False):
     """Write a human-readable log to submission_logs/ and a JSON run spec to workspace/run_specs/. Returns the spec path."""
     print('logging user code')
     os.makedirs(log_dir, exist_ok=True)
@@ -111,7 +137,7 @@ def log_submission(user_code, user, log_dir, full_run, use_holdout=False, toy_pa
     # JSON run spec for the job to read
     spec_path = os.path.join(SPEC_DIR, f"{base}.json")
     with open(spec_path, 'w') as f:
-        json.dump({'user': user, 'code': user_code, 'full_run': full_run, 'use_holdout': use_holdout, 'toy_param_grids': toy_param_grids}, f)
+        json.dump({'user': user, 'code': user_code, 'full_run': full_run, 'use_holdout': use_holdout, 'toy_param_grids': toy_param_grids, 'final_evaluation': final_evaluation}, f)
 
     return spec_path
 
@@ -202,7 +228,7 @@ def _trigger_vertex_job(json_file_path):
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def run_submission(user_code, user, log_dir, full_run, use_holdout=False, toy_param_grids=False):
+def run_submission(user_code, user, log_dir, full_run, use_holdout=False, toy_param_grids=False, final_evaluation=False):
     """
     Top-level entry point called from app.py.
     Logs submission, validates code synchronously, triggers the job,
@@ -242,9 +268,9 @@ def run_submission(user_code, user, log_dir, full_run, use_holdout=False, toy_pa
         full_run = False
 
     print('checking counter')
+    safe = _safe_user(user)
     # Rate limit check: only applies to full_run jobs
     if full_run:
-        safe = _safe_user(user)
         year, week = _current_iso_week()
         count = _get_full_run_count(safe, year, week)
         if count >= FULL_RUN_WEEKLY_LIMIT:
@@ -256,15 +282,28 @@ def run_submission(user_code, user, log_dir, full_run, use_holdout=False, toy_pa
                     f'Limit resets at the start of the next calendar week.'
                 ),
             }, 429
+    if final_evaluation:
+        fe_count = _get_final_eval_count(safe)
+        if fe_count >= FINAL_EVAL_LIMIT:
+            return {
+                'success': False,
+                'error': (
+                    f'Final evaluation limit reached: you have already used your '
+                    f'{FINAL_EVAL_LIMIT} final evaluation submission.'
+                ),
+            }, 429
     print('logging submission')
-    json_file_path = log_submission(user_code, user, log_dir, full_run, use_holdout, toy_param_grids)
+    json_file_path = log_submission(user_code, user, log_dir, full_run, use_holdout, toy_param_grids, final_evaluation)
     print('logged submission')
     _trigger_vertex_job(json_file_path)
     print('triggered job')
-    # Increment counter only after successful job trigger
+    # Increment counters only after successful job trigger
     if full_run:
         new_count = _increment_full_run_count(safe, year, week)
         print(f'Rate limit counter for {safe} week {year}-W{week:02d}: {new_count}/{FULL_RUN_WEEKLY_LIMIT}')
+    if final_evaluation:
+        new_fe_count = _increment_final_eval_count(safe)
+        print(f'Final evaluation counter for {safe}: {new_fe_count}/{FINAL_EVAL_LIMIT}')
 
     return {'success': True, 'message': message.strip() + f" Full run: {full_run}."}, 202
 
@@ -284,7 +323,7 @@ def execute():
         return {'success': False, 'error': 'No code provided. Send JSON with "code" field.'}, 400
     if not data.get('user'):
         return {'success': False, 'error': 'No user provided. Send JSON with "user" field.'}, 400
-    print(f"Received submission: user={data.get('user')} full_run={data.get('full_run')} toy_param_grids={data.get('toy_param_grids')} code_len={len(data.get('code', ''))}")
+    print(f"Received submission: user={data.get('user')} full_run={data.get('full_run')} toy_param_grids={data.get('toy_param_grids')} final_evaluation={data.get('final_evaluation')} code_len={len(data.get('code', ''))}")
     return run_submission(
         data['code'],
         data['user'],
@@ -292,6 +331,7 @@ def execute():
         data.get('full_run', False),
         data.get('use_holdout', False),
         data.get('toy_param_grids', False),
+        data.get('final_evaluation', False),
     )
 
 @app.route('/get_counters', methods=['GET'])

@@ -13,6 +13,6 @@ COPY job_vertex/job_logic.py .
 COPY job_vertex/entrypoint.sh .
 RUN chmod +x entrypoint.sh
 
-COPY data_for_bucket/togo_2018_oct_dec /data/togo_2018_oct_dec
+COPY data_for_bucket /data
 
 CMD ["./entrypoint.sh"]
