@@ -1,6 +1,8 @@
+import builtins
 import datetime
 import inspect
 import io
+import json
 import os
 import shutil
 import smtplib
@@ -10,6 +12,9 @@ import warnings
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+
+# Always flush prints so Cloud Run logs appear immediately
+print = lambda *a, **kw: builtins.print(*a, **{**kw, 'flush': True})
 
 import matplotlib
 matplotlib.use('Agg')
@@ -73,9 +78,10 @@ RF_PARAM_GRID = {
     "model__min_samples_leaf": [1, 2, 5, 10],
     "model__max_features": ["sqrt", "log2", 0.5],
 }
-RF_N_ITER = 40  # RandomizedSearchCV samples
+RF_N_ITER = 25  # RandomizedSearchCV samples
 
-LGBM_N_TRIALS = 100  # Optuna trials per outer fold, matching the notebook
+LGBM_N_TRIALS = 30  # Optuna trials per outer fold, matching the notebook
+
 LGBM_SEARCH_BOUNDS = {
     'learning_rate':     (0.01, 0.5),
     'max_depth':         (1, 10),
@@ -744,6 +750,31 @@ def _merge_feature_stats(corr_df, mi_df):
 # Email
 # ---------------------------------------------------------------------------
 
+def _fmt_left_table(df, float_fmt='.4f'):
+    """Format a DataFrame with string columns left-aligned and numeric columns right-aligned."""
+    cols = list(df.columns)
+    str_cols = {c for c in cols if df[c].dtype == object}
+
+    formatted = {}
+    for col in cols:
+        if col in str_cols:
+            formatted[col] = df[col].astype(str).tolist()
+        else:
+            formatted[col] = [f'{v:{float_fmt}}' if pd.notna(v) else 'N/A' for v in df[col]]
+
+    widths = {col: max(len(col), max((len(s) for s in formatted[col]), default=0)) for col in cols}
+
+    def _row(vals):
+        parts = []
+        for col, val in zip(cols, vals):
+            parts.append(val.ljust(widths[col]) if col in str_cols else val.rjust(widths[col]))
+        return '  '.join(parts)
+
+    header = '  '.join(c.ljust(widths[c]) if c in str_cols else c.rjust(widths[c]) for c in cols)
+    rows = [_row([formatted[col][i] for col in cols]) for i in range(len(df))]
+    return '\n'.join([header] + rows)
+
+
 def _format_email(result, final_evaluation=False):
     """Return (subject, body) for a human-readable result email."""
     if not result.get('success'):
@@ -790,10 +821,10 @@ def _format_email(result, final_evaluation=False):
         lines.append('')
         lines.append('=== Feature Importance ===')
         best_alone = result.get('best_alone_model', 'best model')
-        lines.append(f'Showing lift and model importance for your features (model: {best_alone}).')
+        lines.append(f'Showing lift and model importance for your features when evaluated alone (without Cider features) (model: {best_alone}).')
         lines.append('Lift = drop in R² when that feature is randomly shuffled (higher = more important).')
         lines.append('')
-        lines.append(importance_df.to_string(index=False, float_format=lambda x: f'{x:.4f}'))
+        lines.append(_fmt_left_table(importance_df))
         lines.append('')
 
     correlation_df = result.get('correlation_df')
@@ -801,7 +832,7 @@ def _format_email(result, final_evaluation=False):
         lines.append('')
         lines.append('=== Per-Feature Correlation & Mutual Information ===')
         display_cols = [c for c in ['feature', 'pearson', 'pearson_pvalue', 'mutual_info', 'coverage'] if c in correlation_df.columns]
-        lines.append(correlation_df[display_cols].to_string(index=False, float_format=lambda x: f'{x:.4f}'))
+        lines.append(_fmt_left_table(correlation_df[display_cols]))
 
     hp_alone = result.get('hp_log_user_only', '')
     hp_merged = result.get('hp_log_merged', '')
@@ -847,7 +878,13 @@ def _send_email(to_address, result, importance_fig=None, final_evaluation=False)
             smtp.starttls()
             smtp.login(GMAIL_FROM, password)
             smtp.sendmail(GMAIL_FROM, [to_address], msg.as_string())
-        print(f'{_pt()} Email sent to {to_address}')
+        print(json.dumps({
+            'severity': 'INFO',
+            'message': f'{_pt()} Email sent to {to_address}: {subject}',
+            'email_to': to_address,
+            'email_subject': subject,
+            'email_body': body,
+        }))
     except Exception as e:
         print(f'{_pt()} Failed to send email to {to_address}: {e}')
 

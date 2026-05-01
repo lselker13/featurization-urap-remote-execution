@@ -180,11 +180,15 @@ def _trigger_cloud_run_job(json_file_path):
     print(f'Job triggered: {resp.json().get("name")}')
 
 
-def _trigger_vertex_job(json_file_path, user=None, submission_id=None, full_run=None):
+_MACHINE_TYPE_HIGH_CPU = 'n1-highmem-16'   # 16 vCPUs, 104 GB
+_MACHINE_TYPE_DEFAULT  = 'n1-highmem-8'    # 8 vCPUs,  52 GB
+
+
+def _trigger_vertex_job(json_file_path, user=None, submission_id=None, full_run=None, high_cpu=False):
     """Trigger a Vertex AI Custom Job, passing the submission JSON path via env var."""
     region = os.environ.get('JOB_REGION', 'us-central1')
     image_uri = os.environ.get('IMAGE_URI', 'us-central1-docker.pkg.dev/gol-cdr-featurization-comp/featurization-jobs/featurization-evaluator-vertex:latest')
-    machine_type = os.environ.get('MACHINE_TYPE', 'n1-highmem-16')
+    machine_type = _MACHINE_TYPE_HIGH_CPU if high_cpu else _MACHINE_TYPE_DEFAULT
     gmail_password = os.environ.get('GMAIL_APP_PASSWORD', '')
     print('Fetching credentials')
 
@@ -229,6 +233,8 @@ def _trigger_vertex_job(json_file_path, user=None, submission_id=None, full_run=
 
     resp = authed_session.post(url, json=body, timeout=30)
 
+    if not resp.ok:
+        print(f'Vertex AI error {resp.status_code}: {resp.text}', flush=True)
     resp.raise_for_status()
     print(f'Job triggered: {resp.json().get("name")}')
 
@@ -237,7 +243,7 @@ def _trigger_vertex_job(json_file_path, user=None, submission_id=None, full_run=
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def run_submission(user_code, user, log_dir, full_run, use_holdout=False, toy_param_grids=False, final_evaluation=False):
+def run_submission(user_code, user, log_dir, full_run, use_holdout=False, toy_param_grids=False, final_evaluation=False, high_cpu=False):
     """
     Top-level entry point called from app.py.
     Logs submission, validates code synchronously, triggers the job,
@@ -304,7 +310,7 @@ def run_submission(user_code, user, log_dir, full_run, use_holdout=False, toy_pa
     print('logging submission')
     json_file_path, submission_id = log_submission(user_code, user, log_dir, full_run, use_holdout, toy_param_grids, final_evaluation)
     print('logged submission')
-    _trigger_vertex_job(json_file_path, user=user, submission_id=submission_id, full_run=full_run)
+    _trigger_vertex_job(json_file_path, user=user, submission_id=submission_id, full_run=full_run, high_cpu=high_cpu)
     print('triggered job')
     # Increment counters only after successful job trigger
     if full_run:
@@ -332,7 +338,7 @@ def execute():
         return {'success': False, 'error': 'No code provided. Send JSON with "code" field.'}, 400
     if not data.get('user'):
         return {'success': False, 'error': 'No user provided. Send JSON with "user" field.'}, 400
-    print(f"Received submission: user={data.get('user')} full_run={data.get('full_run')} toy_param_grids={data.get('toy_param_grids')} final_evaluation={data.get('final_evaluation')} code_len={len(data.get('code', ''))}")
+    print(f"Received submission: user={data.get('user')} full_run={data.get('full_run')} toy_param_grids={data.get('toy_param_grids')} final_evaluation={data.get('final_evaluation')} high_cpu={data.get('high_cpu')} code_len={len(data.get('code', ''))}")
     return run_submission(
         data['code'],
         data['user'],
@@ -341,6 +347,7 @@ def execute():
         data.get('use_holdout', False),
         data.get('toy_param_grids', False),
         data.get('final_evaluation', False),
+        data.get('high_cpu', False),
     )
 
 @app.route('/get_counters', methods=['GET'])
