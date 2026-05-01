@@ -27,6 +27,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.inspection import permutation_importance as _permutation_importance
 from sklearn.linear_model import Lasso, Ridge
 from sklearn.metrics import r2_score
+from sklearn.feature_selection import mutual_info_regression
 from sklearn.model_selection import GridSearchCV, KFold, ParameterGrid, RandomizedSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -604,6 +605,126 @@ def _compute_feature_importance(merged_features, consumption, cider_feature_cols
 
 
 # ---------------------------------------------------------------------------
+# Feature correlations
+# ---------------------------------------------------------------------------
+
+def _compute_feature_correlations(user_features, consumption, user, featurizer_name, impute_missing=True):
+    """
+    Compute per-feature Pearson correlation with log_consumption.
+
+    n_obs and coverage reflect raw non-NaN counts before any imputation.
+    If impute_missing=True, NaN values are filled with the column median
+    before computing Pearson (all n_total rows are then used).
+    If impute_missing=False, only rows with a non-NaN value are used.
+
+    Returns a DataFrame with columns:
+        [user, featurizer_name, feature, n_obs, coverage, pearson, pearson_pvalue]
+    sorted by |pearson| descending. Returns None if fewer than 3 observations.
+    """
+    data = user_features.join(consumption, how='inner').dropna(subset=[consumption.name])
+    n_total = len(data)
+    if n_total < 3:
+        return None
+
+    y_all = data[consumption.name].values
+    rows = []
+    for col in user_features.columns:
+        x = data[col]
+        valid = x.notna()
+        n_obs = int(valid.sum())
+        coverage = n_obs / n_total
+        if impute_missing:
+            x_vals = x.fillna(x.median()).values
+            y_vals = y_all
+        else:
+            x_vals = x[valid].values
+            y_vals = y_all[valid.values]
+        if len(x_vals) < 3 or x_vals.std() == 0:
+            r, p = np.nan, np.nan
+        else:
+            r, p = pearsonr(x_vals, y_vals)
+        rows.append({
+            'user': user,
+            'featurizer_name': featurizer_name,
+            'feature': col,
+            'n_obs': n_obs,
+            'coverage': float(round(coverage, 4)),
+            'pearson': float(round(r, 4)) if not np.isnan(r) else np.nan,
+            'pearson_pvalue': float(round(p, 6)) if not np.isnan(p) else np.nan,
+        })
+
+    return (
+        pd.DataFrame(rows)
+        .assign(pearson_abs=lambda d: d['pearson'].abs())
+        .sort_values('pearson_abs', ascending=False)
+        .drop(columns='pearson_abs')
+        .reset_index(drop=True)
+    )
+
+
+def _compute_feature_mutual_info(user_features, consumption, user, featurizer_name, impute_missing=True):
+    """
+    Compute per-feature mutual information with log_consumption.
+
+    n_obs and coverage reflect raw non-NaN counts before any imputation.
+    If impute_missing=True, NaN values are filled with the column median
+    before computing MI. If impute_missing=False, any NaN in any feature
+    column will raise (mutual_info_regression does not handle NaNs).
+
+    Returns a DataFrame with columns:
+        [user, featurizer_name, feature, n_obs, coverage, mutual_info]
+    sorted by mutual_info descending. Returns None if fewer than 3 observations.
+    """
+    data = user_features.join(consumption, how='inner').dropna(subset=[consumption.name])
+    n_total = len(data)
+    if n_total < 3:
+        return None
+
+    feature_cols = list(user_features.columns)
+    X = data[feature_cols]
+    y = data[consumption.name].values
+
+    # Compute n_obs / coverage on raw data before imputation
+    n_obs_map = {col: int(X[col].notna().sum()) for col in feature_cols}
+    coverage_map = {col: round(n_obs_map[col] / n_total, 4) for col in feature_cols}
+
+    if impute_missing:
+        X = X.apply(lambda col: col.fillna(col.median()))
+
+    mi_scores = mutual_info_regression(X.values, y, random_state=RANDOM_SEED)
+
+    rows = [
+        {
+            'user': user,
+            'featurizer_name': featurizer_name,
+            'feature': col,
+            'n_obs': n_obs_map[col],
+            'coverage': float(coverage_map[col]),
+            'mutual_info': float(round(mi_scores[i], 6)),
+        }
+        for i, col in enumerate(feature_cols)
+    ]
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values('mutual_info', ascending=False)
+        .reset_index(drop=True)
+    )
+
+
+def _merge_feature_stats(corr_df, mi_df):
+    """Join Pearson and MI DataFrames on feature identity, keeping shared metadata once."""
+    if corr_df is None or mi_df is None:
+        return corr_df  # return whatever we have
+    merged = corr_df.merge(
+        mi_df[['user', 'featurizer_name', 'feature', 'mutual_info']],
+        on=['user', 'featurizer_name', 'feature'],
+        how='left',
+    )
+    return merged.sort_values('pearson', key=lambda s: s.abs(), ascending=False).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
 # Email
 # ---------------------------------------------------------------------------
 
@@ -1169,6 +1290,11 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
                     best_params=best_params_alone.get(best_alone_model, {}),
                 )
 
+            correlation_df = _merge_feature_stats(
+                _compute_feature_correlations(user_features, consumption, user, name),
+                _compute_feature_mutual_info(user_features, consumption, user, name),
+            )
+
             return {
                 'success': True,
                 'use_holdout': True,
@@ -1179,6 +1305,7 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
                 'importance_df': importance_df,
                 'best_alone_model': best_alone_model,
                 '_importance_fig': importance_fig,
+                'correlation_df': correlation_df,
             }
 
         cv_start = time.time()
@@ -1221,6 +1348,11 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
                 best_params=best_params_alone.get(best_alone_model, {}),
             )
 
+        correlation_df = _merge_feature_stats(
+            _compute_feature_correlations(user_features, consumption, user, name),
+            _compute_feature_mutual_info(user_features, consumption, user, name),
+        )
+
         return {
             'success': True,
             'results_user_features_only': results_alone,
@@ -1230,6 +1362,7 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
             'importance_df': importance_df,
             'best_alone_model': best_alone_model,
             '_importance_fig': importance_fig,
+            'correlation_df': correlation_df,
         }
 
     except Exception as e:
