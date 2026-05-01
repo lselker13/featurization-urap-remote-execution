@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import geopandas as gpd
-from scipy.stats import pearsonr, spearmanr
+from scipy.stats import pearsonr, rankdata, spearmanr
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.exceptions import ConvergenceWarning
@@ -667,7 +667,10 @@ def _compute_feature_correlations(user_features, consumption, user, featurizer_n
 
 def _compute_feature_mutual_info(user_features, consumption, user, featurizer_name, impute_missing=True):
     """
-    Compute per-feature mutual information with log_consumption.
+    Compute per-feature mutual information with log_consumption in three variants:
+      - mi:           raw features (after optional imputation)
+      - mi_norm:      z-score normalized features (zero mean, unit variance)
+      - mi_rank_norm: rank-normalized features (uniform [1/n, ..., 1])
 
     n_obs and coverage reflect raw non-NaN counts before any imputation.
     If impute_missing=True, NaN values are filled with the column median
@@ -675,8 +678,8 @@ def _compute_feature_mutual_info(user_features, consumption, user, featurizer_na
     column will raise (mutual_info_regression does not handle NaNs).
 
     Returns a DataFrame with columns:
-        [user, featurizer_name, feature, n_obs, coverage, mutual_info]
-    sorted by mutual_info descending. Returns None if fewer than 3 observations.
+        [user, featurizer_name, feature, n_obs, coverage, mi, mi_norm, mi_rank_norm]
+    sorted by mi descending. Returns None if fewer than 3 observations.
     """
     data = user_features.join(consumption, how='inner').dropna(subset=[consumption.name])
     n_total = len(data)
@@ -694,7 +697,15 @@ def _compute_feature_mutual_info(user_features, consumption, user, featurizer_na
     if impute_missing:
         X = X.apply(lambda col: col.fillna(col.median()))
 
-    mi_scores = mutual_info_regression(X.values, y, random_state=RANDOM_SEED)
+    X_raw = X.values
+
+    X_norm = StandardScaler().fit_transform(X_raw)
+
+    X_rank = np.apply_along_axis(lambda col: rankdata(col) / len(col), 0, X_raw)
+
+    mi_raw       = mutual_info_regression(X_raw,  y, random_state=RANDOM_SEED)
+    mi_norm      = mutual_info_regression(X_norm, y, random_state=RANDOM_SEED)
+    mi_rank_norm = mutual_info_regression(X_rank, y, random_state=RANDOM_SEED)
 
     rows = [
         {
@@ -703,14 +714,16 @@ def _compute_feature_mutual_info(user_features, consumption, user, featurizer_na
             'feature': col,
             'n_obs': n_obs_map[col],
             'coverage': float(coverage_map[col]),
-            'mutual_info': float(round(mi_scores[i], 6)),
+            'mi':           float(round(mi_raw[i],       6)),
+            'mi_norm':      float(round(mi_norm[i],      6)),
+            'mi_rank_norm': float(round(mi_rank_norm[i], 6)),
         }
         for i, col in enumerate(feature_cols)
     ]
 
     return (
         pd.DataFrame(rows)
-        .sort_values('mutual_info', ascending=False)
+        .sort_values('mi', ascending=False)
         .reset_index(drop=True)
     )
 
@@ -720,7 +733,7 @@ def _merge_feature_stats(corr_df, mi_df):
     if corr_df is None or mi_df is None:
         return corr_df  # return whatever we have
     merged = corr_df.merge(
-        mi_df[['user', 'featurizer_name', 'feature', 'mutual_info']],
+        mi_df[['user', 'featurizer_name', 'feature', 'mi', 'mi_norm', 'mi_rank_norm']],
         on=['user', 'featurizer_name', 'feature'],
         how='left',
     )
