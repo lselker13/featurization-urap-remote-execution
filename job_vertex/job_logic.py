@@ -658,7 +658,6 @@ def _format_email(result, final_evaluation=False):
         lines.append('')
         lines.append(importance_df.to_string(index=False, float_format=lambda x: f'{x:.4f}'))
         lines.append('')
-        lines.append('(Figure attached as feature_importance.png)')
 
     hp_alone = result.get('hp_log_user_only', '')
     hp_merged = result.get('hp_log_merged', '')
@@ -681,7 +680,7 @@ def _send_email(to_address, result, importance_fig=None, final_evaluation=False)
         return
     subject, body = _format_email(result, final_evaluation=final_evaluation)
 
-    if importance_fig is not None:
+    if importance_fig is not None and False:
         msg = MIMEMultipart('mixed')
         msg.attach(MIMEText(body))
         buf = io.BytesIO()
