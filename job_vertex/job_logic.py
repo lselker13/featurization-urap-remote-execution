@@ -607,7 +607,7 @@ def _compute_feature_importance(merged_features, consumption, cider_feature_cols
 # Feature correlations
 # ---------------------------------------------------------------------------
 
-def _compute_feature_correlations(user_features, consumption, user, featurizer_name, impute_missing=False):
+def _compute_feature_correlations(user_features, consumption, user, featurizer_name, impute_missing=True):
     """
     Compute per-feature Pearson correlation with log_consumption.
 
@@ -661,7 +661,7 @@ def _compute_feature_correlations(user_features, consumption, user, featurizer_n
     )
 
 
-def _compute_feature_mutual_info(user_features, consumption, user, featurizer_name, impute_missing=False):
+def _compute_feature_mutual_info(user_features, consumption, user, featurizer_name, impute_missing=True):
     """
     Compute per-feature mutual information with log_consumption.
 
