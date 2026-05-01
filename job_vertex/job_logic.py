@@ -674,9 +674,9 @@ def _compute_feature_correlations(user_features, consumption, user, featurizer_n
 def _compute_feature_mutual_info(user_features, consumption, user, featurizer_name, impute_missing=True):
     """
     Compute per-feature mutual information with log_consumption in three variants:
-      - mi:           raw features (after optional imputation)
-      - mi_norm:      z-score normalized features (zero mean, unit variance)
-      - mi_rank_norm: rank-normalized features (uniform [1/n, ..., 1])
+      - unnormalized_mutual_information: raw features (after optional imputation)
+      - normalized_mutual_information:   z-score normalized features (zero mean, unit variance)
+      - rank_mutual_information:         rank-normalized features (uniform [1/n, ..., 1])
 
     n_obs and coverage reflect raw non-NaN counts before any imputation.
     If impute_missing=True, NaN values are filled with the column median
@@ -684,8 +684,8 @@ def _compute_feature_mutual_info(user_features, consumption, user, featurizer_na
     column will raise (mutual_info_regression does not handle NaNs).
 
     Returns a DataFrame with columns:
-        [user, featurizer_name, feature, n_obs, coverage, mi, mi_norm, mi_rank_norm]
-    sorted by mi descending. Returns None if fewer than 3 observations.
+        [user, featurizer_name, feature, n_obs, coverage, unnormalized_mutual_information, normalized_mutual_information, rank_mutual_information]
+    sorted by unnormalized_mutual_information descending. Returns None if fewer than 3 observations.
     """
     data = user_features.join(consumption, how='inner').dropna(subset=[consumption.name])
     n_total = len(data)
@@ -709,9 +709,9 @@ def _compute_feature_mutual_info(user_features, consumption, user, featurizer_na
 
     X_rank = np.apply_along_axis(lambda col: rankdata(col) / len(col), 0, X_raw)
 
-    mi_raw       = mutual_info_regression(X_raw,  y, random_state=RANDOM_SEED)
-    mi_norm      = mutual_info_regression(X_norm, y, random_state=RANDOM_SEED)
-    mi_rank_norm = mutual_info_regression(X_rank, y, random_state=RANDOM_SEED)
+    mi_raw                        = mutual_info_regression(X_raw,  y, random_state=RANDOM_SEED)
+    normalized_mutual_information = mutual_info_regression(X_norm, y, random_state=RANDOM_SEED)
+    rank_mutual_information       = mutual_info_regression(X_rank, y, random_state=RANDOM_SEED)
 
     rows = [
         {
@@ -720,16 +720,16 @@ def _compute_feature_mutual_info(user_features, consumption, user, featurizer_na
             'feature': col,
             'n_obs': n_obs_map[col],
             'coverage': float(coverage_map[col]),
-            'mi':           float(round(mi_raw[i],       6)),
-            'mi_norm':      float(round(mi_norm[i],      6)),
-            'mi_rank_norm': float(round(mi_rank_norm[i], 6)),
+            'unnormalized_mutual_information': float(round(mi_raw[i],                        6)),
+            'normalized_mutual_information':   float(round(normalized_mutual_information[i], 6)),
+            'rank_mutual_information':         float(round(rank_mutual_information[i],       6)),
         }
         for i, col in enumerate(feature_cols)
     ]
 
     return (
         pd.DataFrame(rows)
-        .sort_values('mi', ascending=False)
+        .sort_values('unnormalized_mutual_information', ascending=False)
         .reset_index(drop=True)
     )
 
@@ -739,7 +739,7 @@ def _merge_feature_stats(corr_df, mi_df):
     if corr_df is None or mi_df is None:
         return corr_df  # return whatever we have
     merged = corr_df.merge(
-        mi_df[['user', 'featurizer_name', 'feature', 'mi', 'mi_norm', 'mi_rank_norm']],
+        mi_df[['user', 'featurizer_name', 'feature', 'unnormalized_mutual_information', 'normalized_mutual_information', 'rank_mutual_information']],
         on=['user', 'featurizer_name', 'feature'],
         how='left',
     )
@@ -831,7 +831,7 @@ def _format_email(result, final_evaluation=False):
     if correlation_df is not None and not correlation_df.empty:
         lines.append('')
         lines.append('=== Per-Feature Correlation & Mutual Information ===')
-        display_cols = [c for c in ['feature', 'pearson', 'pearson_pvalue', 'mutual_info', 'coverage'] if c in correlation_df.columns]
+        display_cols = [c for c in ['feature', 'pearson', 'pearson_pvalue', 'normalized_mutual_information', 'rank_mutual_information', 'coverage'] if c in correlation_df.columns]
         lines.append(_fmt_left_table(correlation_df[display_cols]))
 
     hp_alone = result.get('hp_log_user_only', '')
@@ -964,12 +964,18 @@ def _log_individual_features(name, user, timestamp, correlation_df, sheet_id=Non
     )
     service = build('sheets', 'v4', credentials=creds)
     rows = [
-        [name, user, row.get('feature', ''), timestamp, row.get('pearson', ''), row.get('mutual_info', '')]
+        [
+            name, user, row.get('feature', ''), timestamp,
+            row.get('pearson', ''),
+            row.get('unnormalized_mutual_information', ''),
+            row.get('normalized_mutual_information', ''),
+            row.get('rank_mutual_information', ''),
+        ]
         for _, row in correlation_df.iterrows()
     ]
     service.spreadsheets().values().append(
         spreadsheetId=sheet_id or SHEET_ID,
-        range=f"'{INDIVIDUAL_FEATURES_TAB}'!A:F",
+        range=f"'{INDIVIDUAL_FEATURES_TAB}'!A:H",
         valueInputOption='USER_ENTERED',
         insertDataOption='INSERT_ROWS',
         body={'values': rows},
