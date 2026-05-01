@@ -2,6 +2,7 @@ import datetime
 import inspect
 import io
 import os
+import shutil
 import smtplib
 import time
 import traceback
@@ -90,6 +91,7 @@ TORCH_GRID = list(ParameterGrid({
 TORCH_LIGHT_PARAMS = {"lr": 1e-3, "weight_decay": 1e-4, "patience": 10}
 
 # Single-point grids used when toy_param_grids=True — one value near the middle of each range.
+TOY_LASSO_PARAM_GRID = {"model__alpha": [0.0316]}  # middle of logspace(-4, 1, 7)
 TOY_RF_PARAM_GRID = {
     "model__n_estimators": [1000],
     "model__max_depth": [10],
@@ -113,6 +115,7 @@ FINAL_EVAL_SHEET_ID = '1a_evWLy8NxFcaD89knoc4F3mCHqfeX0AiSBmOrIEqJ0'
 SHEET_TAB = 'Results log'
 LEADERBOARD_STANDALONE_TAB = 'Leaderboard: Stand-alone'
 LEADERBOARD_MERGED_TAB = 'Leaderboard: Along with existing features'
+INDIVIDUAL_FEATURES_TAB = 'Log: Individual Features'
 LEADERBOARD_SIZE = 10
 
 GMAIL_FROM = 'featurizationtestserver@gmail.com'
@@ -780,6 +783,13 @@ def _format_email(result, final_evaluation=False):
         lines.append(importance_df.to_string(index=False, float_format=lambda x: f'{x:.4f}'))
         lines.append('')
 
+    correlation_df = result.get('correlation_df')
+    if correlation_df is not None and not correlation_df.empty:
+        lines.append('')
+        lines.append('=== Per-Feature Correlation & Mutual Information ===')
+        display_cols = [c for c in ['feature', 'pearson', 'pearson_pvalue', 'mutual_info', 'coverage'] if c in correlation_df.columns]
+        lines.append(correlation_df[display_cols].to_string(index=False, float_format=lambda x: f'{x:.4f}'))
+
     hp_alone = result.get('hp_log_user_only', '')
     hp_merged = result.get('hp_log_merged', '')
     if hp_alone or hp_merged:
@@ -894,6 +904,28 @@ def _update_leaderboard(sheet_tab, name, user, timestamp, r2, model_type, sheet_
         ).execute()
 
 
+def _log_individual_features(name, user, timestamp, correlation_df, sheet_id=None):
+    """Append one row per feature to the Individual Features leaderboard tab."""
+    if correlation_df is None or correlation_df.empty:
+        return
+    print(f'{_pt()} logging individual features to sheet')
+    creds, _ = google.auth.default(
+        scopes=['https://www.googleapis.com/auth/spreadsheets']
+    )
+    service = build('sheets', 'v4', credentials=creds)
+    rows = [
+        [name, user, row.get('feature', ''), timestamp, row.get('pearson', ''), row.get('mutual_info', '')]
+        for _, row in correlation_df.iterrows()
+    ]
+    service.spreadsheets().values().append(
+        spreadsheetId=sheet_id or SHEET_ID,
+        range=f"'{INDIVIDUAL_FEATURES_TAB}'!A:F",
+        valueInputOption='USER_ENTERED',
+        insertDataOption='INSERT_ROWS',
+        body={'values': rows},
+    ).execute()
+
+
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
@@ -995,7 +1027,8 @@ def _run_cv_evaluation(features, consumption, full_run, sample_weight=None, name
     all_results = {}
 
     print(f'{_pt()} starting lasso: {name}')
-    y_true, y_pred, lasso_params_per_fold = _cv_sklearn(X, y, lasso_pipeline, LASSO_PARAM_GRID, outer_kf, inner_kf, 'lasso', sample_weight=sw)
+    lasso_grid = TOY_LASSO_PARAM_GRID if toy_param_grids else LASSO_PARAM_GRID
+    y_true, y_pred, lasso_params_per_fold = _cv_sklearn(X, y, lasso_pipeline, lasso_grid, outer_kf, inner_kf, 'lasso', sample_weight=sw)
     all_results['Lasso'] = _bootstrap_metrics(y_true, y_pred)
 
     print(f'{_pt()} starting ridge: {name}')
@@ -1077,7 +1110,8 @@ def _run_holdout_evaluation(features, consumption, full_run, holdout_ids, sample
     all_results = {}
 
     print(f'{_pt()} starting holdout lasso: {name}')
-    gs = GridSearchCV(lasso_pipeline, LASSO_PARAM_GRID, cv=inner_kf, n_jobs=-1, verbose=0)
+    lasso_grid = TOY_LASSO_PARAM_GRID if toy_param_grids else LASSO_PARAM_GRID
+    gs = GridSearchCV(lasso_pipeline, lasso_grid, cv=inner_kf, n_jobs=-1, verbose=0)
     fit_params = {'model__sample_weight': sw_train} if sw_train is not None else {}
     gs.fit(X_train, y_train, **fit_params)
     all_results['Lasso'] = _bootstrap_metrics(y_holdout.values, gs.best_estimator_.predict(X_holdout))
@@ -1150,7 +1184,7 @@ def _execute_code(user_code):
         }
 
 
-def run_job(user_code, user, data_dir, full_run, use_holdout=False, toy_param_grids=False, final_evaluation=False):
+def run_job(user_code, user, data_dir, full_run, use_holdout=False, toy_param_grids=False, final_evaluation=False, log_txt_path=None):
     """
     Run the full evaluation pipeline for a submitted featurizer.
 
@@ -1171,6 +1205,18 @@ def run_job(user_code, user, data_dir, full_run, use_holdout=False, toy_param_gr
     result = evaluate_featurizer(FeaturizerClass, data_dir, user=user, full_run=full_run, use_holdout=use_holdout, toy_param_grids=toy_param_grids, final_evaluation=final_evaluation)
     importance_fig = result.pop('_importance_fig', None)
     _send_email(user, result, importance_fig=importance_fig, final_evaluation=final_evaluation)
+
+    if final_evaluation and result.get('success'):
+        if  log_txt_path and os.path.exists(log_txt_path):
+            dest_dir = os.path.join(os.path.dirname(log_txt_path), 'successful_final_runs')
+            os.makedirs(dest_dir, exist_ok=True)
+            shutil.copy2(log_txt_path, dest_dir)
+            print(f'{_pt()} Copied final evaluation log to {dest_dir}')
+        elif log_txt_path:
+            print(f'Warning: Unable to copy log. Log path doesnt exist: {log_txt_path}')
+        else:
+            print(f'Warning: Unable to copy log. Log path not provided.')
+
     return result
 
 
@@ -1295,6 +1341,9 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
                 _compute_feature_mutual_info(user_features, consumption, user, name),
             )
 
+            if final_evaluation:
+                _log_individual_features(name, user, timestamp, correlation_df, sheet_id=active_sheet_id)
+
             return {
                 'success': True,
                 'use_holdout': True,
@@ -1352,6 +1401,9 @@ def evaluate_featurizer(FeaturizerClass, data_dir, user, full_run, use_holdout=F
             _compute_feature_correlations(user_features, consumption, user, name),
             _compute_feature_mutual_info(user_features, consumption, user, name),
         )
+
+        if final_evaluation:
+            _log_individual_features(name, user, timestamp, correlation_df, sheet_id=active_sheet_id)
 
         return {
             'success': True,

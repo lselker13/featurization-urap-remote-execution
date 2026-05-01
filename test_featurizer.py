@@ -6,7 +6,7 @@ class Featurizer:
         return 'count transactions'
 
     def featurize(
-        self, 
+        self,
         cdr=None,
         mobile_money=None,
         mobile_data=None,
@@ -14,13 +14,12 @@ class Featurizer:
         antennas=None,
         shapefiles=None
     ):
-
         outgoing = cdr.copy()
         outgoing.rename(
             columns={
                 'caller_msisdn': 'ego',
                 'recipient_msisdn': 'alter',
-            }, 
+            },
             inplace=True
         )
         outgoing['direction'] = 'outgoing'
@@ -30,14 +29,13 @@ class Featurizer:
             columns={
                 'caller_msisdn': 'alter',
                 'recipient_msisdn': 'ego',
-            }, 
+            },
             inplace=True
         )
         incoming['direction'] = 'incoming'
 
         bidirectional = pd.concat((outgoing, incoming))
 
-        num_transactions = bidirectional.groupby('ego').apply(len).rename('num_transactions')
-
-        return num_transactions.to_frame()
-    
+        num_outgoing = outgoing.groupby('ego').apply(len).rename('num_outgoing')
+        num_incoming = incoming.groupby('ego').apply(len).rename('num_incoming')
+        return num_incoming.to_frame().join(num_outgoing)

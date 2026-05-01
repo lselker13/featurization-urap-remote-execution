@@ -135,11 +135,12 @@ def log_submission(user_code, user, log_dir, full_run, use_holdout=False, toy_pa
         f.write(txt_content)
 
     # JSON run spec for the job to read
+    txt_path = os.path.join(log_dir, f"{base}.txt")
     spec_path = os.path.join(SPEC_DIR, f"{base}.json")
     with open(spec_path, 'w') as f:
-        json.dump({'user': user, 'code': user_code, 'full_run': full_run, 'use_holdout': use_holdout, 'toy_param_grids': toy_param_grids, 'final_evaluation': final_evaluation}, f)
+        json.dump({'user': user, 'code': user_code, 'full_run': full_run, 'use_holdout': use_holdout, 'toy_param_grids': toy_param_grids, 'final_evaluation': final_evaluation, 'log_txt_path': txt_path}, f)
 
-    return spec_path
+    return spec_path, submission_id
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +180,7 @@ def _trigger_cloud_run_job(json_file_path):
     print(f'Job triggered: {resp.json().get("name")}')
 
 
-def _trigger_vertex_job(json_file_path):
+def _trigger_vertex_job(json_file_path, user=None, submission_id=None, full_run=None):
     """Trigger a Vertex AI Custom Job, passing the submission JSON path via env var."""
     region = os.environ.get('JOB_REGION', 'us-central1')
     image_uri = os.environ.get('IMAGE_URI', 'us-central1-docker.pkg.dev/gol-cdr-featurization-comp/featurization-jobs/featurization-evaluator-vertex:latest')
@@ -200,8 +201,16 @@ def _trigger_vertex_job(json_file_path):
         f'/projects/{gcp_project}/locations/{region}/customJobs'
     )
     display_name = f'featurization-evaluator-{datetime.datetime.now(PACIFIC).strftime("%Y%m%d-%H%M%S")}-{uuid.uuid4().hex[:6]}'
+    def _label_safe(s):
+        return ''.join(c if c.isalnum() or c == '-' else '_' for c in (s or 'anonymous').lower())[:63]
+
     body = {
         'displayName': display_name,
+        'labels': {
+            'user': _label_safe(user),
+            'full_run': str(full_run)
+            # 'submission-id': _label_safe(submission_id) if submission_id else 'unknown',
+        },
         'jobSpec': {
             'workerPoolSpecs': [{
                 'machineSpec': {'machineType': machine_type},
@@ -293,9 +302,9 @@ def run_submission(user_code, user, log_dir, full_run, use_holdout=False, toy_pa
                 ),
             }, 429
     print('logging submission')
-    json_file_path = log_submission(user_code, user, log_dir, full_run, use_holdout, toy_param_grids, final_evaluation)
+    json_file_path, submission_id = log_submission(user_code, user, log_dir, full_run, use_holdout, toy_param_grids, final_evaluation)
     print('logged submission')
-    _trigger_vertex_job(json_file_path)
+    _trigger_vertex_job(json_file_path, user=user, submission_id=submission_id, full_run=full_run)
     print('triggered job')
     # Increment counters only after successful job trigger
     if full_run:
@@ -389,6 +398,43 @@ def reset_counter():
         'success': True,
         'message': f'Counter reset to 0 for user "{data["user"]}" (week {year}-W{week:02d}).',
     }, 200
+
+@app.route('/get_final_eval_counter', methods=['GET'])
+def get_final_eval_counter():
+    """
+    Return the final_evaluation submission count for a given user.
+    Query param: user (required)
+    """
+    user = request.args.get('user')
+    if not user:
+        return {'success': False, 'error': 'No user provided. Pass ?user=... as a query param.'}, 400
+    safe = _safe_user(user)
+    count = _get_final_eval_count(safe)
+    return {'success': True, 'user': user, 'count': count, 'limit': FINAL_EVAL_LIMIT}, 200
+
+
+@app.route('/reset_final_eval_counter', methods=['POST'])
+def reset_final_eval_counter():
+    """
+    Reset a user's final_evaluation counter to 0.
+    Body: {"user": "..."}
+    """
+    data = request.get_json()
+    if not data or not data.get('user'):
+        return {'success': False, 'error': 'No user provided. Send JSON with "user" field.'}, 400
+    safe = _safe_user(data['user'])
+    client = _gcs_client()
+    bucket = client.bucket(RATE_LIMIT_BUCKET)
+    blob = bucket.blob(f'final_evaluation_runs/{safe}.json')
+    blob.upload_from_string(
+        json.dumps({'user': safe, 'count': 0}),
+        content_type='application/json',
+    )
+    return {
+        'success': True,
+        'message': f'Final evaluation counter reset to 0 for user "{data["user"]}".',
+    }, 200
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))

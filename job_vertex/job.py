@@ -36,6 +36,7 @@ def main():
         payload.get('use_holdout', False),
         payload.get('toy_param_grids', False),
         payload.get('final_evaluation', False),
+        payload.get('log_txt_path'),
     )
 
     if not result.get('success'):
