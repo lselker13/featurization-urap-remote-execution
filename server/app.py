@@ -180,11 +180,11 @@ def _trigger_cloud_run_job(json_file_path):
     print(f'Job triggered: {resp.json().get("name")}')
 
 
-_MACHINE_TYPE_HIGH_CPU = 'n1-highmem-16'   # 16 vCPUs, 104 GB
-_MACHINE_TYPE_DEFAULT  = 'n1-highmem-8'    # 8 vCPUs,  52 GB
+_MACHINE_TYPE_HIGH_CPU = 'n1-highmem-32'   # 32 vCPUs, 298 GB
+_MACHINE_TYPE_DEFAULT  = 'n1-highmem-16'    # 16 vCPUs,  104 GB
 
 
-def _trigger_vertex_job(json_file_path, user=None, submission_id=None, full_run=None, high_cpu=False):
+def _trigger_vertex_job(json_file_path, user=None, submission_id=None, full_run=None, high_cpu=False, final_evaluation=False):
     """Trigger a Vertex AI Custom Job, passing the submission JSON path via env var."""
     region = os.environ.get('JOB_REGION', 'us-central1')
     image_uri = os.environ.get('IMAGE_URI', 'us-central1-docker.pkg.dev/gol-cdr-featurization-comp/featurization-jobs/featurization-evaluator-vertex:latest')
@@ -212,7 +212,8 @@ def _trigger_vertex_job(json_file_path, user=None, submission_id=None, full_run=
         'displayName': display_name,
         'labels': {
             'user': _label_safe(user),
-            'full_run': str(full_run).lower()
+            'full_run': str(full_run).lower(),
+            'final_evaluation': str(final_evaluation).lower(),
             # 'submission-id': _label_safe(submission_id) if submission_id else 'unknown',
         },
         'jobSpec': {
@@ -278,6 +279,17 @@ def run_submission(user_code, user, log_dir, full_run, use_holdout=False, toy_pa
     else:
         use_holdout = False
 
+    if isinstance(final_evaluation, bool):
+        pass
+    elif final_evaluation is None or not isinstance(final_evaluation, str):
+        final_evaluation = False
+    elif final_evaluation.lower() == 'true':
+        final_evaluation = True
+    elif final_evaluation.lower() == 'false':
+        final_evaluation = False
+    else:
+        final_evaluation = False
+
     if full_run and (not ALLOW_FULL_RUN):
         message += ' Warning: full_run not yet permitted; overriding to False.'
         full_run = False
@@ -298,6 +310,7 @@ def run_submission(user_code, user, log_dir, full_run, use_holdout=False, toy_pa
                 ),
             }, 429
     if final_evaluation:
+        use_holdout = False
         fe_count = _get_final_eval_count(safe)
         if fe_count >= FINAL_EVAL_LIMIT:
             return {
@@ -310,7 +323,7 @@ def run_submission(user_code, user, log_dir, full_run, use_holdout=False, toy_pa
     print('logging submission')
     json_file_path, submission_id = log_submission(user_code, user, log_dir, full_run, use_holdout, toy_param_grids, final_evaluation)
     print('logged submission')
-    _trigger_vertex_job(json_file_path, user=user, submission_id=submission_id, full_run=full_run, high_cpu=high_cpu)
+    _trigger_vertex_job(json_file_path, user=user, submission_id=submission_id, full_run=full_run, high_cpu=high_cpu, final_evaluation=final_evaluation)
     print('triggered job')
     # Increment counters only after successful job trigger
     if full_run:

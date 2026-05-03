@@ -12,6 +12,8 @@ import warnings
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from google.cloud import storage as _gcs
+
 
 # Always flush prints so Cloud Run logs appear immediately
 print = lambda *a, **kw: builtins.print(*a, **{**kw, 'flush': True})
@@ -963,13 +965,21 @@ def _log_individual_features(name, user, timestamp, correlation_df, sheet_id=Non
         scopes=['https://www.googleapis.com/auth/spreadsheets']
     )
     service = build('sheets', 'v4', credentials=creds)
+    def _clean(v):
+        try:
+            if v != v:  # NaN check
+                return ''
+        except TypeError:
+            pass
+        return v
+
     rows = [
         [
             name, user, row.get('feature', ''), timestamp,
-            row.get('pearson', ''),
-            row.get('unnormalized_mutual_information', ''),
-            row.get('normalized_mutual_information', ''),
-            row.get('rank_mutual_information', ''),
+            _clean(row.get('pearson', '')),
+            _clean(row.get('unnormalized_mutual_information', '')),
+            _clean(row.get('normalized_mutual_information', '')),
+            _clean(row.get('rank_mutual_information', '')),
         ]
         for _, row in correlation_df.iterrows()
     ]
@@ -1263,13 +1273,18 @@ def run_job(user_code, user, data_dir, full_run, use_holdout=False, toy_param_gr
     _send_email(user, result, importance_fig=importance_fig, final_evaluation=final_evaluation)
 
     if final_evaluation and result.get('success'):
-        if  log_txt_path and os.path.exists(log_txt_path):
-            dest_dir = os.path.join(os.path.dirname(log_txt_path), 'successful_final_runs')
-            os.makedirs(dest_dir, exist_ok=True)
-            shutil.copy2(log_txt_path, dest_dir)
-            print(f'{_pt()} Copied final evaluation log to {dest_dir}')
-        elif log_txt_path:
-            print(f'Warning: Unable to copy log. Log path doesnt exist: {log_txt_path}')
+        if log_txt_path:
+            try:
+                _GCS_BUCKET = 'featurization-test-bucket'
+                _DATA_PREFIX = '/data/'
+                client = _gcs.Client()
+                bucket = client.bucket(_GCS_BUCKET)
+                src_blob_name = log_txt_path.removeprefix(_DATA_PREFIX)
+                dest_blob_name = 'successful_final_runs/' + os.path.basename(log_txt_path)
+                bucket.copy_blob(bucket.blob(src_blob_name), bucket, dest_blob_name)
+                print(f'{_pt()} Copied final evaluation log to gs://{_GCS_BUCKET}/{dest_blob_name}')
+            except Exception as e:
+                print(f'Warning: Unable to copy log to GCS: {e}')
         else:
             print(f'Warning: Unable to copy log. Log path not provided.')
 
